@@ -1,0 +1,120 @@
+from __future__ import annotations
+
+from uuid import UUID
+
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi.responses import JSONResponse
+from sqlalchemy.orm import Session
+
+from app.api.deps import get_current_user, get_db_session
+from app.schemas.lexeme import (
+    LexemeCreateRequest,
+    LexemeDetail,
+    LexemeListResponse,
+    LexemeMergeGroupsRequest,
+    LexemeUpdateRequest,
+)
+from app.services.auth_service import AuthenticatedUser
+from app.services.lexeme_service import LexemeConflictError, LexemeService, get_lexeme_service
+
+
+router = APIRouter(prefix="/lexemes")
+
+
+def _conflict_response(exc: LexemeConflictError) -> JSONResponse:
+    return JSONResponse(status_code=status.HTTP_409_CONFLICT, content=exc.payload())
+
+
+@router.post("", response_model=LexemeDetail, status_code=status.HTTP_201_CREATED)
+async def create_lexeme(
+    request: LexemeCreateRequest,
+    current_user: AuthenticatedUser = Depends(get_current_user),
+    session: Session = Depends(get_db_session),
+    lexeme_service: LexemeService = Depends(get_lexeme_service),
+) -> LexemeDetail | JSONResponse:
+    try:
+        return lexeme_service.create_lexeme(session, user_id=current_user.user_id, request=request)
+    except LexemeConflictError as exc:
+        return _conflict_response(exc)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+
+
+@router.get("", response_model=LexemeListResponse)
+async def list_lexemes(
+    search: str | None = Query(default=None),
+    limit: int = Query(default=20, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    current_user: AuthenticatedUser = Depends(get_current_user),
+    session: Session = Depends(get_db_session),
+    lexeme_service: LexemeService = Depends(get_lexeme_service),
+) -> LexemeListResponse:
+    items, total = lexeme_service.list_lexemes(
+        session,
+        user_id=current_user.user_id,
+        limit=limit,
+        offset=offset,
+        search=search,
+    )
+    return LexemeListResponse(items=items, total=total, limit=limit, offset=offset)
+
+
+@router.get("/{lexeme_id}", response_model=LexemeDetail)
+async def get_lexeme(
+    lexeme_id: UUID,
+    current_user: AuthenticatedUser = Depends(get_current_user),
+    session: Session = Depends(get_db_session),
+    lexeme_service: LexemeService = Depends(get_lexeme_service),
+) -> LexemeDetail:
+    lexeme = lexeme_service.get_user_lexeme(session, user_id=current_user.user_id, lexeme_id=lexeme_id)
+    if lexeme is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Lexeme not found.")
+    return lexeme_service.get_lexeme_detail(session, user_id=current_user.user_id, lexeme_id=lexeme_id)
+
+
+@router.patch("/{lexeme_id}", response_model=LexemeDetail)
+async def update_lexeme(
+    lexeme_id: UUID,
+    request: LexemeUpdateRequest,
+    current_user: AuthenticatedUser = Depends(get_current_user),
+    session: Session = Depends(get_db_session),
+    lexeme_service: LexemeService = Depends(get_lexeme_service),
+) -> LexemeDetail:
+    try:
+        lexeme = lexeme_service.update_lexeme(
+            session,
+            user_id=current_user.user_id,
+            lexeme_id=lexeme_id,
+            request=request,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+
+    if lexeme is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Lexeme not found.")
+    return lexeme
+
+
+@router.post("/{lexeme_id}/merge-groups", response_model=LexemeDetail)
+async def merge_lexeme_groups(
+    lexeme_id: UUID,
+    request: LexemeMergeGroupsRequest,
+    current_user: AuthenticatedUser = Depends(get_current_user),
+    session: Session = Depends(get_db_session),
+    lexeme_service: LexemeService = Depends(get_lexeme_service),
+) -> LexemeDetail | JSONResponse:
+    try:
+        lexeme = lexeme_service.merge_groups(
+            session,
+            user_id=current_user.user_id,
+            lexeme_id=lexeme_id,
+            request=request,
+        )
+    except LexemeConflictError as exc:
+        return _conflict_response(exc)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+
+    if lexeme is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Lexeme not found.")
+    return lexeme

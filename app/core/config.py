@@ -1,0 +1,95 @@
+from __future__ import annotations
+
+from functools import lru_cache
+
+from pydantic import Field, field_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        case_sensitive=False,
+        extra="ignore",
+    )
+
+    app_env: str = Field(default="development", alias="APP_ENV")
+    log_level: str = Field(default="INFO", alias="LOG_LEVEL")
+    api_host: str = Field(default="0.0.0.0", alias="API_HOST")
+    api_port: int = Field(default=8000, alias="API_PORT")
+    cors_allow_origins: str = Field(
+        default="http://localhost:3000,http://127.0.0.1:3000",
+        alias="CORS_ALLOW_ORIGINS",
+    )
+    cors_allow_origin_regex: str = Field(
+        default=r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$",
+        alias="CORS_ALLOW_ORIGIN_REGEX",
+    )
+
+    database_url: str = Field(alias="DATABASE_URL")
+
+    supabase_url: str = Field(alias="SUPABASE_URL")
+    supabase_publishable_key: str = Field(default="", alias="SUPABASE_PUBLISHABLE_KEY")
+    supabase_service_role_key: str = Field(alias="SUPABASE_SERVICE_ROLE_KEY")
+    supabase_bucket_book_originals: str = Field(
+        default="book-originals",
+        alias="SUPABASE_BUCKET_BOOK_ORIGINALS",
+    )
+    supabase_bucket_page_images: str = Field(
+        default="page-images",
+        alias="SUPABASE_BUCKET_PAGE_IMAGES",
+    )
+    supabase_bucket_ocr_json: str = Field(
+        default="ocr-json",
+        alias="SUPABASE_BUCKET_OCR_JSON",
+    )
+
+    redis_url: str = Field(default="redis://localhost:6379/0", alias="REDIS_URL")
+    celery_broker_url: str = Field(default="redis://localhost:6379/0", alias="CELERY_BROKER_URL")
+    celery_result_backend: str = Field(
+        default="redis://localhost:6379/1",
+        alias="CELERY_RESULT_BACKEND",
+    )
+
+    tessdata_prefix: str | None = Field(default=None, alias="TESSDATA_PREFIX")
+    tesseract_lang: str = Field(default="hye-calfa-n", alias="TESSERACT_LANG")
+    ocr_dpi: int = Field(default=300, alias="OCR_DPI")
+    max_upload_mb: int = Field(default=100, alias="MAX_UPLOAD_MB")
+
+    @field_validator("database_url", mode="before")
+    @classmethod
+    def normalize_database_url(cls, value: str) -> str:
+        if not isinstance(value, str):
+            return value
+
+        normalized = value.strip().strip('"').strip("'")
+        if normalized.startswith("postgres://"):
+            return f"postgresql+psycopg://{normalized[len('postgres://'):]}"
+        if normalized.startswith("postgresql://") and "+" not in normalized.split("://", maxsplit=1)[0]:
+            return f"postgresql+psycopg://{normalized[len('postgresql://'):]}"
+        return normalized
+
+    @field_validator("supabase_url", mode="before")
+    @classmethod
+    def normalize_supabase_url(cls, value: str) -> str:
+        if not isinstance(value, str):
+            return value
+        return value.strip().strip('"').strip("'").rstrip("/")
+
+    @property
+    def max_upload_bytes(self) -> int:
+        return self.max_upload_mb * 1024 * 1024
+
+    @property
+    def cors_allow_origins_list(self) -> list[str]:
+        return [
+            origin.strip()
+            for origin in self.cors_allow_origins.split(",")
+            if origin.strip()
+        ]
+
+
+@lru_cache(maxsize=1)
+def get_settings() -> Settings:
+    return Settings()

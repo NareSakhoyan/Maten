@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "armenian-books-backend"
+version = "0.1.0"
+description = "FastAPI backend for Armenian historical-books OCR and word-occurrence extraction."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+  "fastapi>=0.115,<1.0",
+  "uvicorn[standard]>=0.30,<1.0",
+  "pydantic-settings>=2.4,<3.0",
+  "sqlalchemy>=2.0,<3.0",
+  "alembic>=1.13,<2.0",
+  "psycopg[binary]>=3.2,<4.0",
+  "celery[redis]>=5.4,<6.0",
+  "redis>=5.0,<6.0",
+  "supabase>=2.6,<3.0",
+  "python-multipart>=0.0.9,<0.1",
+  "pymupdf>=1.24,<2.0",
+  "Pillow>=10.4,<11.0",
+  "opencv-python-headless>=4.10,<5.0",
+  "pytesseract>=0.3.10,<0.4",
+  "regex>=2024.7.24",
+]
+
+[project.optional-dependencies]
+dev = [
+  "httpx>=0.27,<1.0",
+  "pytest>=8.3,<9.0",
+]
+
+[project.scripts]
+bootstrap-storage = "app.scripts.bootstrap_storage:main"
+
+[tool.setuptools.packages.find]
+include = ["app*"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]

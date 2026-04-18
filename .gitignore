@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+backend/.venv/
+
+# Environment files
+.env
+.env.*
+!.env.example
+
+# Backend packaging/build artifacts
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Node / Next.js
+node_modules/
+web/node_modules/
+web/.next/
+web/out/
+
+# Coverage and logs
+.coverage
+.coverage.*
+coverage/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
