@@ -3,10 +3,10 @@ from __future__ import annotations
 from collections.abc import Sequence
 from uuid import UUID
 
-from sqlalchemy import func, select, update
+from sqlalchemy import Text, cast, func, select, update
 from sqlalchemy.orm import Session
 
-from app.db.models import Document, Lexeme, LexemeForm, Occurrence
+from app.db.models import Document, Lexeme, LexemeForm, Occurrence, ReferenceMatchTargetType
 from app.schemas.lexeme import (
     LexemeCreateRequest,
     LexemeDetail,
@@ -14,6 +14,7 @@ from app.schemas.lexeme import (
     LexemeSummary,
     LexemeUpdateRequest,
 )
+from app.schemas.reference import ReferenceStatusFilter
 from app.utils.text_normalization import normalize_token, normalize_token_list
 
 
@@ -41,6 +42,13 @@ class LexemeConflictError(Exception):
 
 
 class LexemeService:
+    def __init__(self, *, reference_matching_service=None) -> None:
+        if reference_matching_service is None:
+            from app.services.reference_matching_service import ReferenceMatchingService
+
+            reference_matching_service = ReferenceMatchingService()
+        self.reference_matching_service = reference_matching_service
+
     def create_lexeme(
         self,
         session: Session,
@@ -88,6 +96,7 @@ class LexemeService:
         limit: int,
         offset: int,
         search: str | None = None,
+        reference_status: ReferenceStatusFilter = ReferenceStatusFilter.ALL,
     ) -> tuple[list[LexemeSummary], int]:
         user_key = str(user_id)
         filters = [Lexeme.user_id == user_key]
@@ -98,6 +107,13 @@ class LexemeService:
                     (Lexeme.canonical_normalized_form.ilike(f"%{normalized_search}%"))
                     | (Lexeme.canonical_form.ilike(f"%{search.strip()}%"))
                 )
+        filters.extend(
+            self._reference_status_filters(
+                session,
+                user_id=user_id,
+                reference_status=reference_status,
+            )
+        )
 
         total = session.scalar(select(func.count(Lexeme.id)).where(*filters)) or 0
 
@@ -133,6 +149,11 @@ class LexemeService:
             .offset(offset)
         ).all()
 
+        reference_summary_map = self.reference_matching_service.lexeme_summary_map(
+            session,
+            user_id=user_id,
+            lexeme_ids=[row.Lexeme.id for row in rows],
+        )
         items = [
             LexemeSummary(
                 id=row.Lexeme.id,
@@ -144,6 +165,9 @@ class LexemeService:
                 occurrence_count=row.occurrence_count,
                 created_at=row.Lexeme.created_at,
                 updated_at=row.Lexeme.updated_at,
+                has_reference_match=reference_summary_map[str(row.Lexeme.id)].has_reference_match,
+                reference_match_count=reference_summary_map[str(row.Lexeme.id)].reference_match_count,
+                best_reference_match=reference_summary_map[str(row.Lexeme.id)].best_reference_match,
             )
             for row in rows
         ]
@@ -184,6 +208,12 @@ class LexemeService:
             if len(sample_contexts) >= 5:
                 break
 
+        reference_summary = self.reference_matching_service.lexeme_summary_map(
+            session,
+            user_id=user_id,
+            lexeme_ids=[lexeme.id],
+        )[str(lexeme.id)]
+
         return LexemeDetail(
             id=lexeme.id,
             canonical_form=lexeme.canonical_form,
@@ -195,6 +225,9 @@ class LexemeService:
             sample_contexts=sample_contexts,
             created_at=lexeme.created_at,
             updated_at=lexeme.updated_at,
+            has_reference_match=reference_summary.has_reference_match,
+            reference_match_count=reference_summary.reference_match_count,
+            best_reference_match=reference_summary.best_reference_match,
         )
 
     def update_lexeme(
@@ -336,6 +369,31 @@ class LexemeService:
             .values(lexeme_id=lexeme_id)
         )
 
+    def _reference_status_filters(
+        self,
+        session: Session,
+        *,
+        user_id: UUID,
+        reference_status: ReferenceStatusFilter,
+    ) -> list[object]:
+        if reference_status is ReferenceStatusFilter.ALL:
+            return []
+
+        match_keys = self.reference_matching_service.reference_status_filter_for_session(
+            session,
+            user_id=user_id,
+            target_type=ReferenceMatchTargetType.LEXEME,
+        )
+        if match_keys is None:
+            return []
+        lexeme_key = func.replace(cast(Lexeme.id, Text), "-", "")
+        normalized_match_keys = select(func.replace(match_keys.subquery().c.target_key, "-", ""))
+        if reference_status is ReferenceStatusFilter.MATCHED:
+            return [lexeme_key.in_(normalized_match_keys)]
+        return [~lexeme_key.in_(normalized_match_keys)]
+
 
 def get_lexeme_service() -> LexemeService:
-    return LexemeService()
+    from app.services.reference_matching_service import ReferenceMatchingService
+
+    return LexemeService(reference_matching_service=ReferenceMatchingService())

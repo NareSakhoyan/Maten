@@ -32,6 +32,16 @@ class Settings(BaseSettings):
     supabase_url: str = Field(alias="SUPABASE_URL")
     supabase_publishable_key: str = Field(default="", alias="SUPABASE_PUBLISHABLE_KEY")
     supabase_service_role_key: str = Field(alias="SUPABASE_SERVICE_ROLE_KEY")
+    supabase_auth_timeout_seconds: float = Field(
+        default=5.0,
+        alias="SUPABASE_AUTH_TIMEOUT_SECONDS",
+        gt=0,
+    )
+    supabase_auth_cache_ttl_seconds: int = Field(
+        default=60,
+        alias="SUPABASE_AUTH_CACHE_TTL_SECONDS",
+        ge=0,
+    )
     supabase_bucket_book_originals: str = Field(
         default="book-originals",
         alias="SUPABASE_BUCKET_BOOK_ORIGINALS",
@@ -56,6 +66,9 @@ class Settings(BaseSettings):
     tesseract_lang: str = Field(default="hye-calfa-n", alias="TESSERACT_LANG")
     ocr_dpi: int = Field(default=300, alias="OCR_DPI")
     max_upload_mb: int = Field(default=100, alias="MAX_UPLOAD_MB")
+    reference_import_max_line_length: int = Field(default=120, alias="REFERENCE_IMPORT_MAX_LINE_LENGTH")
+    reference_pdf_text_min_length: int = Field(default=40, alias="REFERENCE_PDF_TEXT_MIN_LENGTH")
+    reference_fuzzy_threshold_default: int = Field(default=90, alias="REFERENCE_FUZZY_THRESHOLD_DEFAULT")
 
     @field_validator("database_url", mode="before")
     @classmethod

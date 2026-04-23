@@ -42,3 +42,11 @@ yarn-error.log*
 # OS / editor noise
 .DS_Store
 Thumbs.db
+
+# LLM Agents
+.cursor/
+.claude/
+.continue/
+.aider*
+.agent/
+agents/

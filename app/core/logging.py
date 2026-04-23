@@ -1,6 +1,18 @@
 from __future__ import annotations
 
+import logging
 import logging.config
+
+
+class ColorFormatter(logging.Formatter):
+    RESET = "\033[0m"
+    RED = "\033[31m"
+
+    def format(self, record: logging.LogRecord) -> str:
+        formatted = super().format(record)
+        if record.levelno >= logging.ERROR:
+            return f"{self.RED}{formatted}{self.RESET}"
+        return formatted
 
 
 def configure_logging(log_level: str) -> None:
@@ -10,6 +22,7 @@ def configure_logging(log_level: str) -> None:
             "disable_existing_loggers": False,
             "formatters": {
                 "standard": {
+                    "()": "app.core.logging.ColorFormatter",
                     "format": "%(asctime)s %(levelname)s [%(name)s] %(message)s",
                 }
             },
@@ -30,4 +43,3 @@ def configure_logging(log_level: str) -> None:
             },
         }
     )
-

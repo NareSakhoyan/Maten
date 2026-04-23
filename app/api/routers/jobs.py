@@ -2,82 +2,96 @@ from __future__ import annotations
 
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_user, get_db_session
-from app.core.celery_app import celery_app
-from app.schemas.job import IngestionJobRead, RetryJobResponse
+from app.db.models import JobKind
+from app.schemas.common import JobStageEventListResponse, JobStageEventRead
+from app.schemas.job import LongRunningJobListResponse, LongRunningJobRead, RetryJobStartResponse
 from app.services.auth_service import AuthenticatedUser
-from app.services.document_service import DocumentService, get_document_service
-from app.services.ingestion_error_service import get_ingestion_error_service
-from app.services.ingestion_job_service import (
-    IngestionJobService,
-    get_ingestion_job_service,
-)
+from app.services.job_progress_service import JobProgressService, get_job_progress_service
+from app.services.job_retry_service import JobRetryService, get_job_retry_service
+from app.services.long_running_job_service import LongRunningJobService, get_long_running_job_service
+from app.services.retry_errors import RetryStartError
 
 
 router = APIRouter(prefix="/jobs")
 
 
-@router.get("/{job_id}", response_model=IngestionJobRead)
+@router.get("", response_model=LongRunningJobListResponse)
+async def list_jobs(
+    limit: int = Query(default=20, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    job_kind: JobKind | None = Query(default=None),
+    status_filter: str | None = Query(default=None, alias="status"),
+    current_user: AuthenticatedUser = Depends(get_current_user),
+    session: Session = Depends(get_db_session),
+    long_running_job_service: LongRunningJobService = Depends(get_long_running_job_service),
+) -> LongRunningJobListResponse:
+    items, total = long_running_job_service.list_jobs(
+        session,
+        user_id=current_user.user_id,
+        limit=limit,
+        offset=offset,
+        job_kind=job_kind,
+        status=status_filter,
+    )
+    return LongRunningJobListResponse(items=items, total=total, limit=limit, offset=offset)
+
+
+@router.get("/{job_id}", response_model=LongRunningJobRead)
 async def get_job(
     job_id: UUID,
     current_user: AuthenticatedUser = Depends(get_current_user),
     session: Session = Depends(get_db_session),
-    ingestion_job_service: IngestionJobService = Depends(get_ingestion_job_service),
-) -> IngestionJobRead:
-    job = ingestion_job_service.get_user_job(session, user_id=current_user.user_id, job_id=job_id)
+    long_running_job_service: LongRunningJobService = Depends(get_long_running_job_service),
+) -> LongRunningJobRead:
+    job = long_running_job_service.get_user_job(session, user_id=current_user.user_id, job_id=job_id)
     if job is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found.")
-    return ingestion_job_service.build_job_read(session, job)
+    return job
 
 
-@router.post("/{job_id}/retry", response_model=RetryJobResponse)
+@router.get("/{job_id}/events", response_model=JobStageEventListResponse)
+async def list_job_events(
+    job_id: UUID,
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+    current_user: AuthenticatedUser = Depends(get_current_user),
+    session: Session = Depends(get_db_session),
+    long_running_job_service: LongRunningJobService = Depends(get_long_running_job_service),
+    job_progress_service: JobProgressService = Depends(get_job_progress_service),
+) -> JobStageEventListResponse:
+    job = long_running_job_service.get_user_job(session, user_id=current_user.user_id, job_id=job_id)
+    if job is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found.")
+    events = job_progress_service.list_events(
+        session,
+        job_kind=job.job_kind,
+        job_id=job_id,
+        user_id=current_user.user_id,
+    )
+    sliced_events = events[offset:offset + limit]
+    return JobStageEventListResponse(
+        items=[JobStageEventRead.model_validate(event) for event in sliced_events],
+        total=len(events),
+        limit=limit,
+        offset=offset,
+    )
+
+@router.post("/{job_id}/retry", response_model=RetryJobStartResponse)
 async def retry_job(
     job_id: UUID,
     current_user: AuthenticatedUser = Depends(get_current_user),
     session: Session = Depends(get_db_session),
-    ingestion_job_service: IngestionJobService = Depends(get_ingestion_job_service),
-    document_service: DocumentService = Depends(get_document_service),
-) -> RetryJobResponse:
+    job_retry_service: JobRetryService = Depends(get_job_retry_service),
+) -> RetryJobStartResponse:
     try:
-        retry_job = ingestion_job_service.create_retry_job(
+        return job_retry_service.retry_job(
             session,
             user_id=current_user.user_id,
-            failed_job_id=job_id,
+            job_id=job_id,
         )
-    except Exception as exc:
-        from app.services.ingestion_error_service import IngestionRetryError
-
-        if isinstance(exc, IngestionRetryError):
-            raise HTTPException(status_code=exc.status_code, detail=exc.message) from exc
-        raise
-
-    try:
-        celery_app.send_task(
-            "app.workers.tasks.process_document_ingestion",
-            args=[str(retry_job.id)],
-            task_id=str(retry_job.id),
-        )
-        document_service.mark_document_queued(session, document_id=retry_job.document_id)
-    except Exception as exc:
-        failure_info = get_ingestion_error_service().map_exception(exc)
-        document_service.mark_job_failed(
-            session,
-            document_id=retry_job.document_id,
-            job_id=retry_job.id,
-            failure_info=failure_info,
-        )
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to enqueue retry job.",
-        ) from exc
-
-    retry_job = ingestion_job_service.get_user_job(session, user_id=current_user.user_id, job_id=retry_job.id)
-    if retry_job is None:
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Retry job not found.")
-    return RetryJobResponse(
-        message="Retry started",
-        job=ingestion_job_service.build_job_read(session, retry_job),
-    )
+    except RetryStartError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.message) from exc

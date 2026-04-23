@@ -15,9 +15,15 @@ from app.schemas.lexicon import (
     LexiconGroupUnignoreRequest,
     LexiconGroupView,
 )
+from app.schemas.reference import ReferenceStatusFilter, ReferenceTargetMatchesResponse
 from app.services.auth_service import AuthenticatedUser
 from app.services.lexicon_review_service import LexiconReviewService, get_lexicon_review_service
 from app.services.lexicon_service import LexiconService, get_lexicon_service
+from app.services.reference_matching_service import (
+    ReferenceMatchingService,
+    ReferenceSchemaNotReadyError,
+    get_reference_matching_service,
+)
 
 
 router = APIRouter(prefix="/lexicon")
@@ -27,6 +33,7 @@ router = APIRouter(prefix="/lexicon")
 async def list_lexicon_groups(
     search: str | None = Query(default=None),
     view: LexiconGroupView = Query(default=LexiconGroupView.CANDIDATES),
+    reference_status: ReferenceStatusFilter = Query(default=ReferenceStatusFilter.ALL),
     document_id: UUID | None = Query(default=None),
     limit: int = Query(default=20, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
@@ -42,6 +49,7 @@ async def list_lexicon_groups(
         search=search,
         view=view,
         document_id=document_id,
+        reference_status=reference_status,
     )
     return LexiconGroupListResponse(items=items, total=total, limit=limit, offset=offset)
 
@@ -107,3 +115,29 @@ async def get_lexicon_group_detail(
     if group is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Lexicon group not found.")
     return group
+
+
+@router.get("/groups/{normalized_form}/reference-matches", response_model=ReferenceTargetMatchesResponse)
+async def get_lexicon_group_reference_matches(
+    normalized_form: str,
+    current_user: AuthenticatedUser = Depends(get_current_user),
+    session: Session = Depends(get_db_session),
+    lexicon_service: LexiconService = Depends(get_lexicon_service),
+    reference_matching_service: ReferenceMatchingService = Depends(get_reference_matching_service),
+) -> ReferenceTargetMatchesResponse:
+    group = lexicon_service.get_group_detail(
+        session,
+        user_id=current_user.user_id,
+        normalized_form=normalized_form,
+        occurrence_cap=1,
+    )
+    if group is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Lexicon group not found.")
+    try:
+        return reference_matching_service.match_group(
+            session,
+            user_id=current_user.user_id,
+            normalized_form=group.normalized_form,
+        )
+    except ReferenceSchemaNotReadyError as exc:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)) from exc

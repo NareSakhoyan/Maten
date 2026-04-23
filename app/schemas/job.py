@@ -3,31 +3,34 @@ from __future__ import annotations
 from datetime import datetime
 from uuid import UUID
 
-from app.db.models import IngestionJobStatus
-from app.schemas.common import APIModel
+from app.db.models import JobKind, JobResultResourceType
+from app.schemas.common import APIModel, JobProgressState, OffsetPagination
 
 
-class IngestionJobRead(APIModel):
+class LongRunningJobRead(JobProgressState):
     id: UUID
-    document_id: UUID
-    user_id: UUID
-    status: IngestionJobStatus
-    step: str | None
-    progress_percent: int
-    error_message: str | None
+    job_kind: JobKind
+    user_id: str
+    status: str
+    can_retry: bool | None = None
+    latest_retry_job_id: UUID | None = None
+    latest_retry_job_status: str | None = None
     error_code: str | None = None
     error_message_user: str | None = None
     next_steps: list[str] | None = None
-    can_retry: bool = True
-    retry_count: int = 0
-    last_retried_at: datetime | None = None
-    retry_of_job_id: UUID | None = None
-    latest_retry_job_id: UUID | None = None
+    result_resource_type: JobResultResourceType | None = None
+    result_resource_id: str | None = None
     started_at: datetime | None
     finished_at: datetime | None
     created_at: datetime
+    updated_at: datetime
 
 
-class RetryJobResponse(APIModel):
+class LongRunningJobListResponse(OffsetPagination):
+    items: list[LongRunningJobRead]
+
+
+class RetryJobStartResponse(APIModel):
     message: str
-    job: IngestionJobRead
+    document_id: UUID | None = None
+    job: LongRunningJobRead

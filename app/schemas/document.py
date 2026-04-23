@@ -5,7 +5,7 @@ from uuid import UUID
 
 from app.db.models import DocumentStatus
 from app.schemas.common import APIModel, OffsetPagination
-from app.schemas.job import IngestionJobRead
+from app.schemas.job import LongRunningJobRead
 
 
 class DocumentRead(APIModel):
@@ -20,13 +20,20 @@ class DocumentRead(APIModel):
     sha256: str
     page_count: int | None
     status: DocumentStatus
+    latest_job_id: UUID | None = None
+    latest_job_status: str | None = None
+    word_candidate_count: int | None = None
+    unmatched_candidate_count: int | None = None
+    linked_candidate_count: int | None = None
+    suspicious_candidate_count: int | None = None
     created_at: datetime
     updated_at: datetime
 
 
-class DocumentUploadResponse(APIModel):
+class DocumentStartResponse(APIModel):
+    message: str
     document: DocumentRead
-    job: IngestionJobRead
+    job: LongRunningJobRead
 
 
 class DocumentListResponse(OffsetPagination):

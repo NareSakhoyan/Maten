@@ -13,6 +13,7 @@ from app.db.models import (
     LexemeForm,
     Occurrence,
     OccurrenceScriptType,
+    ReferenceMatchTargetType,
 )
 from app.schemas.lexicon import (
     LexiconGroupDetail,
@@ -21,11 +22,19 @@ from app.schemas.lexicon import (
     LexiconGroupSummary,
     LexiconGroupView,
 )
+from app.schemas.reference import ReferenceStatusFilter
 from app.utils.text_normalization import normalize_token
 from app.utils.token_classification import is_suspicious_script_type, suspicion_reasons_for_script_type
 
 
 class LexiconService:
+    def __init__(self, *, reference_matching_service=None) -> None:
+        if reference_matching_service is None:
+            from app.services.reference_matching_service import ReferenceMatchingService
+
+            reference_matching_service = ReferenceMatchingService(lexicon_service=self)
+        self.reference_matching_service = reference_matching_service
+
     def list_groups(
         self,
         session: Session,
@@ -36,6 +45,7 @@ class LexiconService:
         search: str | None = None,
         view: LexiconGroupView = LexiconGroupView.CANDIDATES,
         document_id: UUID | None = None,
+        reference_status: ReferenceStatusFilter = ReferenceStatusFilter.ALL,
     ) -> tuple[list[LexiconGroupSummary], int]:
         group_subquery = self._build_group_subquery(
             user_id=user_id,
@@ -43,6 +53,14 @@ class LexiconService:
             document_id=document_id,
         )
         filters = self._view_filters(group_subquery, view)
+        filters.extend(
+            self._reference_status_filters(
+                session,
+                group_subquery,
+                user_id=user_id,
+                reference_status=reference_status,
+            )
+        )
 
         total = session.scalar(select(func.count()).select_from(group_subquery).where(*filters)) or 0
         rows = session.execute(
@@ -56,6 +74,11 @@ class LexiconService:
             .offset(offset)
         ).all()
 
+        reference_summary_map = self.reference_matching_service.group_summary_map(
+            session,
+            user_id=user_id,
+            normalized_forms=[row.normalized_form for row in rows],
+        )
         items: list[LexiconGroupSummary] = []
         for row in rows:
             sample_tokens, sample_contexts, sample_document_titles = self._load_group_samples(
@@ -65,6 +88,7 @@ class LexiconService:
                 document_id=document_id,
             )
             dominant_script_type = OccurrenceScriptType(row.dominant_script_type)
+            reference_summary = reference_summary_map[row.normalized_form]
             items.append(
                 LexiconGroupSummary(
                     normalized_form=row.normalized_form,
@@ -80,6 +104,9 @@ class LexiconService:
                     dominant_script_type=dominant_script_type,
                     is_suspicious=is_suspicious_script_type(dominant_script_type),
                     suspicion_reasons=suspicion_reasons_for_script_type(dominant_script_type),
+                    has_reference_match=reference_summary.has_reference_match,
+                    reference_match_count=reference_summary.reference_match_count,
+                    best_reference_match=reference_summary.best_reference_match,
                 )
             )
 
@@ -145,6 +172,11 @@ class LexiconService:
         ]
 
         dominant_script_type = OccurrenceScriptType(row.dominant_script_type)
+        reference_summary = self.reference_matching_service.group_summary_map(
+            session,
+            user_id=user_id,
+            normalized_forms=[normalized],
+        )[normalized]
         return LexiconGroupDetail(
             normalized_form=row.normalized_form,
             occurrence_count=row.occurrence_count,
@@ -156,6 +188,9 @@ class LexiconService:
             dominant_script_type=dominant_script_type,
             is_suspicious=is_suspicious_script_type(dominant_script_type),
             suspicion_reasons=suspicion_reasons_for_script_type(dominant_script_type),
+            has_reference_match=reference_summary.has_reference_match,
+            reference_match_count=reference_summary.reference_match_count,
+            best_reference_match=reference_summary.best_reference_match,
             occurrences=occurrences,
         )
 
@@ -339,6 +374,30 @@ class LexiconService:
 
         return sample_tokens, sample_contexts, sample_document_titles
 
+    def _reference_status_filters(
+        self,
+        session: Session,
+        group_subquery,
+        *,
+        user_id: UUID,
+        reference_status: ReferenceStatusFilter,
+    ) -> list[object]:
+        if reference_status is ReferenceStatusFilter.ALL:
+            return []
+
+        match_keys = self.reference_matching_service.reference_status_filter_for_session(
+            session,
+            user_id=user_id,
+            target_type=ReferenceMatchTargetType.LEXICON_GROUP,
+        )
+        if match_keys is None:
+            return []
+        if reference_status is ReferenceStatusFilter.MATCHED:
+            return [group_subquery.c.normalized_form.in_(match_keys)]
+        return [~group_subquery.c.normalized_form.in_(match_keys)]
+
 
 def get_lexicon_service() -> LexiconService:
-    return LexiconService()
+    from app.services.reference_matching_service import ReferenceMatchingService
+
+    return LexiconService(reference_matching_service=ReferenceMatchingService())

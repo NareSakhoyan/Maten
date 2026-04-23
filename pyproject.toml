@@ -23,6 +23,7 @@ dependencies = [
   "Pillow>=10.4,<11.0",
   "opencv-python-headless>=4.10,<5.0",
   "pytesseract>=0.3.10,<0.4",
+  "rapidfuzz>=3.10,<4.0",
   "regex>=2024.7.24",
 ]
 

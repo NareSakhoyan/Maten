@@ -7,14 +7,30 @@ from uuid import UUID, uuid4
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from app.db.models import Document, DocumentPage, DocumentStatus, IngestionJob, IngestionJobStatus, Occurrence
+from app.db.models import (
+    Document,
+    DocumentPage,
+    DocumentStatus,
+    IngestionJob,
+    IngestionJobStatus,
+    JobKind,
+    JobResultResourceType,
+    Occurrence,
+)
+from app.schemas.document import DocumentRead
+from app.services.job_progress_service import JobProgressService, get_job_progress_service
 from app.services.ingestion_error_service import IngestionFailureInfo
 from app.services.storage_service import StorageService, get_storage_service, sanitize_storage_filename
 
 
 class DocumentService:
-    def __init__(self, storage_service: StorageService | None = None) -> None:
+    def __init__(
+        self,
+        storage_service: StorageService | None = None,
+        job_progress_service: JobProgressService | None = None,
+    ) -> None:
         self.storage_service = storage_service or get_storage_service()
+        self.job_progress_service = job_progress_service or get_job_progress_service()
 
     def create_document_and_job(
         self,
@@ -60,10 +76,20 @@ class DocumentService:
             status=IngestionJobStatus.QUEUED,
             step="queued",
             progress_percent=0,
+            result_resource_type=JobResultResourceType.DOCUMENT,
+            result_resource_id=str(document_id),
         )
 
         session.add(document)
         session.add(job)
+        session.flush()
+        self.job_progress_service.set_stage(
+            session,
+            job_kind=JobKind.INGESTION,
+            job=job,
+            stage_code="queued",
+            progress_percent=0,
+        )
         session.commit()
         session.refresh(document)
         session.refresh(job)
@@ -86,7 +112,7 @@ class DocumentService:
         if job is not None:
             job.status = IngestionJobStatus.FAILED
             job.error_message = error_message
-            job.finished_at = datetime.now(timezone.utc)
+            self.job_progress_service.fail(session, job_kind=JobKind.INGESTION, job=job, message_user=error_message)
         session.commit()
 
     def mark_job_failed(
@@ -103,14 +129,18 @@ class DocumentService:
             document.status = DocumentStatus.FAILED
         if job is not None:
             job.status = IngestionJobStatus.FAILED
-            job.step = "failed"
             job.error_message = failure_info.error_message_user
             job.error_code = failure_info.error_code
             job.error_message_user = failure_info.error_message_user
             job.error_message_technical = failure_info.error_message_technical
             job.next_steps = failure_info.next_steps
             job.can_retry = failure_info.can_retry
-            job.finished_at = datetime.now(timezone.utc)
+            self.job_progress_service.fail(
+                session,
+                job_kind=JobKind.INGESTION,
+                job=job,
+                message_user=failure_info.error_message_user,
+            )
         session.commit()
 
     def get_user_document(self, session: Session, *, user_id: UUID, document_id: UUID) -> Document | None:
@@ -119,6 +149,28 @@ class DocumentService:
                 Document.id == document_id,
                 Document.user_id == user_id,
             )
+        )
+
+    def build_document_read(self, session: Session, document: Document) -> DocumentRead:
+        latest_job = session.scalar(
+            select(IngestionJob)
+            .where(IngestionJob.document_id == document.id)
+            .order_by(IngestionJob.created_at.desc(), IngestionJob.id.desc())
+            .limit(1)
+        )
+        from app.services.source_word_review_service import SourceWordReviewService
+
+        workspace_summary = SourceWordReviewService().count_document_workspace_summary(
+            session,
+            user_id=document.user_id,
+            document_id=document.id,
+        )
+        return DocumentRead.model_validate(document).model_copy(
+            update={
+                "latest_job_id": latest_job.id if latest_job is not None else None,
+                "latest_job_status": latest_job.status.value if latest_job is not None else None,
+                **workspace_summary,
+            }
         )
 
     def list_documents(self, session: Session, *, user_id: UUID, limit: int, offset: int) -> tuple[list[Document], int]:

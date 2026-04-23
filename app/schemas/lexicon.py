@@ -8,6 +8,7 @@ from pydantic import Field
 
 from app.db.models import OccurrenceScriptType
 from app.schemas.common import APIModel, OffsetPagination
+from app.schemas.reference import ReferenceMatchBest
 
 
 class LexiconGroupView(str, enum.Enum):
@@ -51,6 +52,9 @@ class LexiconGroupSummary(APIModel):
     dominant_script_type: OccurrenceScriptType
     is_suspicious: bool
     suspicion_reasons: list[str]
+    has_reference_match: bool = False
+    reference_match_count: int = 0
+    best_reference_match: ReferenceMatchBest | None = None
 
 
 class LexiconGroupDetail(APIModel):
@@ -64,6 +68,9 @@ class LexiconGroupDetail(APIModel):
     dominant_script_type: OccurrenceScriptType
     is_suspicious: bool
     suspicion_reasons: list[str]
+    has_reference_match: bool = False
+    reference_match_count: int = 0
+    best_reference_match: ReferenceMatchBest | None = None
     occurrences: list[LexiconGroupOccurrenceRead]
 
 

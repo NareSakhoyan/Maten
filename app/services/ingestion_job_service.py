@@ -6,15 +6,24 @@ from uuid import UUID, uuid4
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from app.db.models import Document, DocumentStatus, IngestionJob, IngestionJobStatus
-from app.schemas.job import IngestionJobRead
+from app.db.models import Document, DocumentStatus, IngestionJob, IngestionJobStatus, JobKind, JobResultResourceType
+from app.schemas.job import LongRunningJobRead
 from app.services.ingestion_error_service import IngestionRetryError
+from app.services.job_progress_service import JobProgressService, get_job_progress_service
+from app.services.long_running_job_service import LongRunningJobService, get_long_running_job_service
 from app.services.storage_service import StorageService, get_storage_service
 
 
 class IngestionJobService:
-    def __init__(self, storage_service: StorageService | None = None) -> None:
+    def __init__(
+        self,
+        storage_service: StorageService | None = None,
+        job_progress_service: JobProgressService | None = None,
+        long_running_job_service: LongRunningJobService | None = None,
+    ) -> None:
         self.storage_service = storage_service or get_storage_service()
+        self.job_progress_service = job_progress_service or get_job_progress_service()
+        self.long_running_job_service = long_running_job_service or get_long_running_job_service()
 
     def get_user_job(self, session: Session, *, user_id: UUID, job_id: UUID) -> IngestionJob | None:
         return session.scalar(
@@ -24,16 +33,8 @@ class IngestionJobService:
             )
         )
 
-    def build_job_read(self, session: Session, job: IngestionJob) -> IngestionJobRead:
-        latest_retry_job_id = session.scalar(
-            select(IngestionJob.id)
-            .where(IngestionJob.retry_of_job_id == job.id)
-            .order_by(IngestionJob.created_at.desc(), IngestionJob.id.desc())
-            .limit(1)
-        )
-        return IngestionJobRead.model_validate(job).model_copy(
-            update={"latest_retry_job_id": latest_retry_job_id}
-        )
+    def build_job_read(self, session: Session, job: IngestionJob) -> LongRunningJobRead:
+        return self.long_running_job_service.build_job_read(job, session=session)
 
     def create_retry_job(self, session: Session, *, user_id: UUID, failed_job_id: UUID) -> IngestionJob:
         job = self.get_user_job(session, user_id=user_id, job_id=failed_job_id)
@@ -69,10 +70,20 @@ class IngestionJobService:
             progress_percent=0,
             retry_count=job.retry_count + 1,
             can_retry=True,
+            result_resource_type=JobResultResourceType.DOCUMENT,
+            result_resource_id=str(job.document_id),
         )
         job.last_retried_at = datetime.now(timezone.utc)
         document.status = DocumentStatus.QUEUED
         session.add(retry_job)
+        session.flush()
+        self.job_progress_service.set_stage(
+            session,
+            job_kind=JobKind.INGESTION,
+            job=retry_job,
+            stage_code="queued",
+            progress_percent=0,
+        )
         session.commit()
         session.refresh(retry_job)
         return retry_job

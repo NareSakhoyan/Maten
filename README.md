@@ -1,6 +1,6 @@
 # Armenian Historical Books OCR Backend
 
-MVP-2 backend for authenticated uploads, page-by-page text extraction, OCR fallback with `pytesseract`, Armenian line-break reconstruction before tokenization, raw word-occurrence indexing, reviewer-centric lexicon discovery, and curated lexeme management against Supabase Postgres and Storage.
+MVP-3 backend for authenticated uploads, page-by-page text extraction, OCR fallback with `pytesseract`, Armenian line-break reconstruction before tokenization, raw word-occurrence indexing, reviewer-centric lexicon discovery, curated lexeme management, personal reference-source matching, source-first reference-entry review, and backend-defined long-running job progress tracking against Supabase Postgres and Storage.
 
 ## Stack
 
@@ -113,16 +113,35 @@ Base path: `/api/v1`
 - `GET /documents/{document_id}/pages`
 - `GET /documents/{document_id}/occurrences`
 - `GET /jobs/{job_id}`
+- `GET /jobs/{job_id}/events`
 - `POST /jobs/{job_id}/retry`
 - `GET /lexicon/groups`
 - `GET /lexicon/groups/{normalized_form}`
+- `GET /lexicon/groups/{normalized_form}/reference-matches`
 - `POST /lexicon/groups/ignore`
 - `POST /lexicon/groups/unignore`
 - `POST /lexemes`
 - `GET /lexemes`
 - `GET /lexemes/{lexeme_id}`
+- `GET /lexemes/{lexeme_id}/reference-matches`
 - `PATCH /lexemes/{lexeme_id}`
 - `POST /lexemes/{lexeme_id}/merge-groups`
+- `POST /reference-sources`
+- `GET /reference-sources`
+- `GET /reference-sources/{source_id}`
+- `GET /reference-sources/{source_id}/entries`
+- `POST /reference-sources/{source_id}/import`
+- `GET /reference-sources/{source_id}/imports`
+- `GET /reference-sources/{source_id}/imports/{import_id}`
+- `GET /reference-sources/{source_id}/imports/{import_id}/events`
+- `POST /reference-matching/runs`
+- `GET /reference-matching/runs`
+- `GET /reference-matching/runs/{run_id}`
+- `GET /reference-matching/runs/{run_id}/results`
+- `GET /reference-matching/runs/{run_id}/results/{result_id}`
+- `GET /reference-matching/runs/{run_id}/target-results`
+- `GET /reference-matching/runs/{run_id}/target-results/{result_id}`
+- `GET /reference-matching/runs/{run_id}/events`
 
 ## Upload Example
 
@@ -143,6 +162,9 @@ curl -H "Authorization: Bearer $SUPABASE_ACCESS_TOKEN" \
 
 curl -H "Authorization: Bearer $SUPABASE_ACCESS_TOKEN" \
   "http://127.0.0.1:8000/api/v1/jobs/<job_id>"
+
+curl -H "Authorization: Bearer $SUPABASE_ACCESS_TOKEN" \
+  "http://127.0.0.1:8000/api/v1/jobs/<job_id>/events"
 ```
 
 After ingestion completes, you can browse grouped normalized forms, triage noise, and curate lexemes:
@@ -172,6 +194,15 @@ curl -X POST "http://127.0.0.1:8000/api/v1/lexemes/<lexeme_id>/merge-groups" \
   -H "Authorization: Bearer $SUPABASE_ACCESS_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"normalized_forms": ["հայկական"]}'
+
+curl -X POST "http://127.0.0.1:8000/api/v1/reference-sources" \
+  -H "Authorization: Bearer $SUPABASE_ACCESS_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "display_name": "My Historical Wordlist",
+    "source_type": "imported_wordlist",
+    "language": "hy"
+  }'
 ```
 
 ## Reviewer Workflow
@@ -195,6 +226,8 @@ python -m app.scripts.reprocess_document <document_id>
 ```
 
 4. Upload and ingest source books first.
+   `POST /api/v1/documents/upload` returns quickly with a queued ingestion job and document metadata.
+   The frontend should poll `/api/v1/jobs/{job_id}` or `/api/v1/jobs/{job_id}/events` instead of waiting for ingestion inside the upload request.
 
 5. Query `/api/v1/lexicon/groups` to inspect derived normalized-form groups built from `occurrences`.
    The default `view=candidates` queue only surfaces unreviewed Armenian groups, sorted by occurrence count.
@@ -204,6 +237,135 @@ python -m app.scripts.reprocess_document <document_id>
 7. Use `/api/v1/lexicon/groups/ignore` and `/api/v1/lexicon/groups/unignore` to bulk hide or restore noise groups without deleting raw evidence.
 
 8. Create curated lexemes with `/api/v1/lexemes` or merge additional normalized forms into an existing lexeme with `/api/v1/lexemes/{lexeme_id}/merge-groups`.
+
+9. Upload personal reference wordlists or dictionary extracts with `/api/v1/reference-sources` and `/api/v1/reference-sources/{source_id}/import`.
+   The import endpoint stores the uploaded file, creates a queued import job, and returns immediately with the job id.
+   The actual parsing, OCR fallback, normalization, and entry creation happen in the background worker.
+   MVP-3 accepts `.txt`, `.csv`, `.docx`, and `.pdf` files.
+   `.txt` is interpreted one entry per line.
+   `.csv` requires a `surface_form` or `normalized_form` column.
+   `.docx` and `.pdf` use conservative line- or paragraph-based candidate extraction rather than full dictionary parsing.
+
+10. Review extracted words directly from the source they came from.
+    Documents expose `/api/v1/documents/{document_id}/word-candidates`.
+    Reference sources expose `/api/v1/reference-sources/{source_id}/word-candidates`, and that response is anchored by the selected source rather than by a corpus-global result list.
+
+11. Open an evidence-first drawer payload with `/api/v1/word-evidence`.
+    The response consolidates traceable evidence rows across imported books, reference sources, and lexicon items for a normalized form.
+
+12. Search words globally with `/api/v1/words/search` and perform a quick lexicon existence check with `/api/v1/words/check`.
+    Search groups results by `lexicon`, `imported_books`, and `reference_sources`.
+
+13. Check a single group or lexeme on demand with `/api/v1/lexicon/groups/{normalized_form}/reference-matches` or `/api/v1/lexemes/{lexeme_id}/reference-matches`.
+    Matching supports exact, normalized, and conservative fuzzy checks.
+
+14. Run stored batch matching with `/api/v1/reference-matching/runs`.
+    Creating a run returns immediately with a queued background job and run id.
+    The primary run-results view is now source-first: `/api/v1/reference-matching/runs/{run_id}/results` returns one row per imported reference entry with lexicon existence flags and imported-book evidence.
+    Completed runs still persist per-target run results for audit and review, but that target-centric snapshot now lives behind `/api/v1/reference-matching/runs/{run_id}/target-results`.
+    Stored results still enrich `/api/v1/lexicon/groups` and `/api/v1/lexemes`, and both list endpoints support `reference_status=matched|unmatched|all`.
+
+## Async Jobs
+
+- heavy operations now follow a short-lived command endpoint plus background worker pattern
+- start endpoints validate input, persist lightweight state, enqueue work, and return immediately with a job payload
+- ingestion upload, ingestion retry, reference import, and reference matching all follow this pattern
+- jobs expose:
+  - `id`
+  - `job_kind`
+  - `status`
+  - stage/progress fields
+  - `result_resource_type`
+  - `result_resource_id`
+  - user-facing error fields when applicable
+- the frontend can poll:
+  - `/api/v1/jobs/{job_id}`
+  - `/api/v1/jobs/{job_id}/events`
+  - `/api/v1/jobs`
+- resource detail responses expose the latest related background job where useful:
+  - documents include `latest_job_id` and `latest_job_status`
+  - reference sources include `latest_import_job_id` and `latest_import_job_status`
+- result-resource links let the frontend redirect the user after completion without guessing where the finished output lives
+
+## Progress Tracking
+
+- ingestion jobs, reference-source imports, and reference matching runs now expose backend-defined progress fields
+- detail responses include:
+  - `current_stage_code`
+  - `current_stage_label`
+  - `stage_message_user`
+  - `progress_percent`
+  - `items_processed`
+  - `items_total`
+- stage labels and messages are defined by the backend so the frontend does not need to infer display text from internal worker state
+- progress is intentionally coarse but grounded in real work such as page processing, target loading, OCR fallback, and result saving
+- event timeline endpoints expose meaningful checkpoints for polling-based UI updates without requiring WebSockets
+- reference-source imports now create durable import-run records, so the latest import state is also exposed from source detail
+
+## Reference Matching
+
+- reference matching remains assistive metadata and background infrastructure
+- matching runs still exist for traceability, progress polling, and batch refresh workflows
+- reference-related matching is now source-first by default on reference routes
+- reference sources are user-owned; each user has a default `manual_reference` source plus any imported sources they create
+- `source_to_internal` is the default run direction for `/api/v1/reference-matching/runs`
+- `source_id` is required for `source_to_internal` runs, and `target_scope` defaults to `all_internal`
+- source-first runs start from one selected reference source and compare each imported reference entry against:
+  - the internal lexicon
+  - imported books / internal corpus occurrences
+- each stored source-first run result is tied back to:
+  - the originating `reference_source`
+  - the exact `reference_entry`
+  - the best internal evidence found so far
+- the primary run-results endpoint is source-entry-centric: each row represents one imported reference entry and shows the source word, normalized form, import provenance, lexicon existence, and imported-book evidence
+- source-entry run results include representative book evidence so the frontend can render matched and unmatched imported entries directly on the run page
+- `internal_to_reference` still exists as an explicit secondary mode for legacy internal-first workflows
+- every completed source-first matching run now stores one run-result row per imported reference entry examined
+- stored target-result rows record whether the target was matched or unmatched, the match count, and a best-match summary for quick review
+- stored target-result detail exposes the full match list captured for that target in the context of the run
+- run detail now exposes `total_items`, `matched_items`, and `unmatched_items` so the frontend can render result summaries directly
+- lightweight linking metadata is included in stored target-result rows so the frontend can jump from a run result back to the related group or lexeme view
+- reference import records how a source was last imported, including whether it came from `txt`, `csv`, `docx`, `pdf_text`, or `pdf_ocr`
+- exact match uses `target == surface_form`
+- normalized match uses `target == normalized_form`
+- fuzzy match is conservative and only runs as a lightweight assistive fallback
+- scanned PDFs first try direct text extraction and then fall back to OCR when the text layer is empty or too weak
+- OCR-derived reference sources expose a warning because imported entries may contain OCR noise
+- exact and normalized matches are safer than fuzzy matches for OCR-derived sources
+- fuzzy matching is disabled for OCR-derived (`pdf_ocr`) sources to reduce false positives
+- match results are assistive metadata only
+- run result summaries are review conveniences; they do not replace the underlying stored `reference_matches`
+- a reference match does not create a lexeme, merge a lexeme, hide a group, or mark anything resolved automatically
+- internet lookup, meaning generation, external semantic enrichment, and morphology-aware auto-merge are still out of scope
+
+## Source-First Review
+
+- documents now expose source-scoped grouped word candidates through `/api/v1/documents/{document_id}/word-candidates`
+- source-scoped document review returns grouped normalized forms, occurrence counts, page counts, sample tokens, sample contexts, sample pages, linked lexeme metadata, suspicious flags, and reference-match summaries
+- reference sources now expose imported entry review through `/api/v1/reference-sources/{source_id}/word-candidates`
+- reference sources also expose raw imported-entry listing through `/api/v1/reference-sources/{source_id}/entries`
+- reference-source review is reference-source-centric: the response includes a top-level source summary for the selected source plus paginated imported entries from that source only
+- reference-source review keeps the imported source visible and includes import method, OCR warning metadata, and lightweight lexicon-link summaries where available
+- document detail now includes workspace-style summary counts such as total candidate groups, linked groups, suspicious groups, and unmatched groups
+- reference source detail now includes imported entry totals plus the latest source-first match run id/status and matched/unmatched entry counts
+
+## Word Evidence
+
+- `/api/v1/word-evidence` is the reusable drawer/detail payload for a normalized form
+- evidence rows are unified across imported books, reference sources, and lexicon items
+- every evidence item includes a traceable source identity, a human-readable source title, and route-hint/reference metadata where practical
+- imported-book evidence includes page number, context snippet, extraction method, and occurrence id
+- reference-source evidence includes source title, route hint, and import provenance metadata
+- lexicon evidence includes the curated lexeme identity and optional occurrence-backed context when available
+- evidence payloads also expose linked lexeme summaries and related reference-match summaries when they exist
+
+## Global Word Search
+
+- `/api/v1/words/search` is now the main cross-source lookup entry point
+- search groups results by `lexicon`, `imported_books`, and `reference_sources`
+- search modes include `exact`, `normalized`, and conservative `fuzzy`
+- `/api/v1/words/check` provides a lightweight "does this already exist?" lexicon check with optional imported-book and reference-source presence flags
+- search prioritizes precision and traceability over broad recall
 
 ## Ingestion Failure Recovery
 
@@ -224,6 +386,15 @@ python -m app.scripts.reprocess_document <document_id>
 - `lexemes` are manual editorial entities created by the user.
 - `lexeme_forms` map normalized forms to curated lexemes.
 - `lexicon_group_reviews` stores manual triage state such as `ignored_noise`.
+- `reference_sources` and `reference_entries` store personal imported or manual lookup material for each user.
+- `reference_sources` also store last import metadata such as import method, warning text, import timestamp, and current entry count.
+- `reference_source_imports` store per-import status, progress, counters, warnings, and completion state for individual reference import runs.
+- `reference_match_runs` now also store `matching_direction`, optional `source_id`, optional `target_scope`, and matched/unmatched summary counts for the completed run.
+- `reference_matches` store assistive match results for lexicon groups and lexemes; they do not replace curation.
+- `reference_match_run_results` store one run-scoped summary row per source entry for source-first runs, with lexicon and imported-book evidence summaries kept on the row for direct matched/unmatched review.
+- `reference_match_run_result_matches` store the run-scoped match snapshots used by target-result detail views.
+- source-first review endpoints are built on top of existing `occurrences`, `lexemes`, `lexeme_forms`, `reference_entries`, and `reference_matches` rather than a separate indexing layer.
+- `job_stage_events` stores timeline checkpoints for ingestion, reference import, and reference matching jobs.
 - ignored groups are hidden from the default reviewer queue but the underlying `occurrences` remain in the database.
 - suspicious groups are separated from the default Armenian candidate queue; they are still available for review and can still be linked into a lexeme manually.
 - assigning a normalized form to a lexeme sets `occurrences.lexeme_id` for existing matching occurrences owned by that user.
@@ -238,8 +409,9 @@ python -m app.scripts.reprocess_document <document_id>
 - OCR page images are uploaded to `page-images`, original files to `book-originals`, and OCR sidecar JSON to `ocr-json`.
 - PDFs use direct text extraction first. Pages without a usable text layer fall back to OCR.
 - Group detail evidence includes human-readable document titles alongside internal document IDs and page numbers.
-- MVP-2 does not implement meanings, external dictionary enrichment, lemma generation, or automatic semantic merge/unmerge.
-- This refinement still does not implement dictionary comparison, Nayiri matching, internet search, semantic suggestions, or automatic morphology-aware merging.
+- MVP-3 does not implement internet search, meaning generation, external semantic enrichment, lemma generation, or automatic semantic merge/unmerge.
+- Reference import is still a lightweight wordlist-style ingestion path. It does not implement full structured dictionary parsing, scholarly multi-column layout understanding, or automatic extraction of dictionary articles and definitions.
+- This refinement still does not implement morphology-aware automatic merge suggestions, Nayiri lookup, or automatic resolution based on a reference hit.
 - Advanced linguistic validation and cross-page continuation handling are intentionally out of scope; only obvious same-page Armenian hyphenated line breaks are reconstructed now.
 
 ## Tests

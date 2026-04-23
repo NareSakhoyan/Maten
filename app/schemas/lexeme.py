@@ -7,6 +7,7 @@ from pydantic import Field
 
 from app.db.models import LexemeStatus
 from app.schemas.common import APIModel, OffsetPagination
+from app.schemas.reference import ReferenceMatchBest
 
 
 class LexemeCreateRequest(APIModel):
@@ -32,6 +33,9 @@ class LexemeSummary(APIModel):
     occurrence_count: int
     created_at: datetime
     updated_at: datetime
+    has_reference_match: bool = False
+    reference_match_count: int = 0
+    best_reference_match: ReferenceMatchBest | None = None
 
 
 class LexemeDetail(APIModel):
@@ -45,6 +49,9 @@ class LexemeDetail(APIModel):
     sample_contexts: list[str]
     created_at: datetime
     updated_at: datetime
+    has_reference_match: bool = False
+    reference_match_count: int = 0
+    best_reference_match: ReferenceMatchBest | None = None
 
 
 class LexemeMergeGroupsRequest(APIModel):
