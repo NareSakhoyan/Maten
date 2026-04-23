@@ -9,13 +9,22 @@ from app.api.routers.documents import get_document, list_document_word_candidate
 from app.api.routers.reference_sources import get_reference_source, list_reference_source_word_candidates
 from app.db.models import ReferenceMatchingDirection
 from app.api.routers.words import check_word, get_word_evidence, search_words
+from app.db.models import ReferenceMatchType
 from app.db.models import Document, DocumentPage, DocumentStatus, LexemeStatus, Occurrence
 from app.schemas.lexeme import LexemeCreateRequest
 from app.schemas.reference import ReferenceMatchRunCreateRequest, ReferenceSourceCreateRequest, ReferenceStatusFilter
-from app.schemas.word import SourceWordStatusView, WordEvidenceSourceType, WordSearchCategory, WordSearchMode
+from app.schemas.word import (
+    SourceWordStatusView,
+    TrustedExternalLookupStatus,
+    WordEvidenceSourceType,
+    WordSearchCategory,
+    WordSearchMode,
+)
 from app.services.auth_service import AuthenticatedUser
 from app.services.lexeme_service import LexemeService
 from app.services.document_service import DocumentService
+from app.services.external_lookup_service import ExternalLookupService
+from app.services.external_sources.base import ExternalEvidenceItem, ExternalLookupProvider, ExternalLookupProviderError
 from app.services.reference_import_service import ReferenceImportService
 from app.services.reference_matching_service import ReferenceMatchingService
 from app.services.reference_source_service import ReferenceSourceService
@@ -32,6 +41,38 @@ def _current_user(user_id: UUID = PRIMARY_USER_ID) -> AuthenticatedUser:
         access_token="test-token",
         email="test@example.com",
     )
+
+
+class StubExternalProvider(ExternalLookupProvider):
+    def __init__(
+        self,
+        *,
+        items: list[ExternalEvidenceItem] | None = None,
+        error: Exception | None = None,
+    ) -> None:
+        self._provider_key = "nayiri_web"
+        self._provider_display_name = "Nayiri"
+        self.items = items or []
+        self.error = error
+        self.calls = 0
+
+    def provider_key(self) -> str:
+        return self._provider_key
+
+    def provider_display_name(self) -> str:
+        return self._provider_display_name
+
+    def search_word(
+        self,
+        *,
+        query: str,
+        normalized_query: str,
+        mode: WordSearchMode,
+    ) -> list[ExternalEvidenceItem]:
+        self.calls += 1
+        if self.error is not None:
+            raise self.error
+        return self.items
 
 
 def _seed_document(db_session, *, user_id: UUID, title: str) -> tuple[Document, DocumentPage, DocumentPage]:
@@ -165,6 +206,16 @@ def _seed_workspace(db_session):
         "source": source,
         "lexeme": lexeme,
     }
+
+
+def _build_word_services(provider: ExternalLookupProvider | None = None) -> tuple[WordEvidenceService, WordSearchService]:
+    external_lookup_service = ExternalLookupService(providers=[provider] if provider is not None else [])
+    word_evidence_service = WordEvidenceService(external_lookup_service=external_lookup_service)
+    word_search_service = WordSearchService(
+        word_evidence_service=word_evidence_service,
+        external_lookup_service=external_lookup_service,
+    )
+    return word_evidence_service, word_search_service
 
 
 def test_document_word_candidates_endpoint_and_document_summary(db_session) -> None:
@@ -413,6 +464,210 @@ def test_global_word_search_and_quick_check(db_session) -> None:
     assert check_response.matching_lexeme_count == 1
     assert check_response.found_in_imported_books is True
     assert check_response.found_in_reference_sources is True
+
+
+def test_word_search_includes_trusted_external_when_requested(db_session) -> None:
+    _seed_workspace(db_session)
+    provider = StubExternalProvider(
+        items=[
+            ExternalEvidenceItem(
+                provider_key="nayiri_web",
+                provider_display_name="Nayiri",
+                matched_form="Հայաստան",
+                normalized_form="հայաստան",
+                source_title="Nayiri Entry",
+                snippet="Հայաստան արտաքին ապացույց",
+                reference_link="https://example.test/nayiri/1",
+                match_type=ReferenceMatchType.NORMALIZED,
+                match_score=100.0,
+            )
+        ]
+    )
+    _, word_search_service = _build_word_services(provider)
+
+    response = asyncio.run(
+        search_words(
+            q="Հայաստան",
+            mode=WordSearchMode.NORMALIZED,
+            include_categories=[WordSearchCategory.LEXICON, WordSearchCategory.TRUSTED_EXTERNAL],
+            include_external=False,
+            provider_keys=None,
+            limit_per_category=20,
+            current_user=_current_user(),
+            session=db_session,
+            word_search_service=word_search_service,
+        )
+    )
+
+    groups = {group.category: group for group in response.groups}
+    assert groups[WordSearchCategory.LEXICON].total >= 1
+    assert groups[WordSearchCategory.TRUSTED_EXTERNAL].total == 1
+    assert groups[WordSearchCategory.TRUSTED_EXTERNAL].status is TrustedExternalLookupStatus.COMPLETED
+    external_item = groups[WordSearchCategory.TRUSTED_EXTERNAL].items[0]
+    assert external_item.source_type is WordEvidenceSourceType.TRUSTED_EXTERNAL
+    assert external_item.provider_display_name == "Nayiri"
+    assert external_item.matched_form == "Հայաստան"
+    assert external_item.reference_link == "https://example.test/nayiri/1"
+
+
+def test_word_search_honors_explicit_include_flags_without_internal_fetches(db_session) -> None:
+    _seed_workspace(db_session)
+    provider = StubExternalProvider(
+        items=[
+            ExternalEvidenceItem(
+                provider_key="nayiri_web",
+                provider_display_name="Nayiri",
+                matched_form="Հայ",
+                normalized_form="հայ",
+                source_title="Nayiri Entry",
+                snippet="Հայ արտաքին ապացույց",
+                reference_link="https://example.test/nayiri/1",
+                match_type=ReferenceMatchType.EXACT,
+                match_score=100.0,
+            )
+        ]
+    )
+    _, word_search_service = _build_word_services(provider)
+
+    response = asyncio.run(
+        search_words(
+            q="հայ",
+            mode=WordSearchMode.NORMALIZED,
+            include_categories=None,
+            include_lexicon=False,
+            include_documents=False,
+            include_reference_sources=False,
+            include_trusted_external=True,
+            include_external=False,
+            provider_keys=None,
+            limit_per_category=20,
+            current_user=_current_user(),
+            session=db_session,
+            word_search_service=word_search_service,
+        )
+    )
+
+    assert [group.category for group in response.groups] == [WordSearchCategory.TRUSTED_EXTERNAL]
+    assert response.groups[0].total == 1
+    assert response.groups[0].status is TrustedExternalLookupStatus.COMPLETED
+    assert provider.calls == 1
+
+
+def test_word_evidence_includes_external_evidence_when_requested(db_session) -> None:
+    _seed_workspace(db_session)
+    provider = StubExternalProvider(
+        items=[
+            ExternalEvidenceItem(
+                provider_key="nayiri_web",
+                provider_display_name="Nayiri",
+                matched_form="Հայաստան",
+                normalized_form="հայաստան",
+                source_title="Nayiri Entry",
+                source_subtitle="Trusted dictionary",
+                snippet="Հայաստան արտաքին ապացույց",
+                reference_link="https://example.test/nayiri/1",
+                match_type=ReferenceMatchType.NORMALIZED,
+                match_score=100.0,
+            )
+        ]
+    )
+    word_evidence_service, _ = _build_word_services(provider)
+
+    response = asyncio.run(
+        get_word_evidence(
+            normalized_form="հայաստան",
+            source_type=None,
+            source_id=None,
+            include_external=True,
+            provider_keys=None,
+            limit=50,
+            offset=0,
+            current_user=_current_user(),
+            session=db_session,
+            word_evidence_service=word_evidence_service,
+        )
+    )
+
+    assert response.summary.total_hits >= 3
+    assert response.external_summary is not None
+    assert response.external_summary.total_hits == 1
+    assert response.external_summary.provider_count == 1
+    assert response.external_summary.status is TrustedExternalLookupStatus.COMPLETED
+    assert len(response.external_evidence_items) == 1
+    external_item = response.external_evidence_items[0]
+    assert external_item.source_type is WordEvidenceSourceType.TRUSTED_EXTERNAL
+    assert external_item.provider_display_name == "Nayiri"
+    assert external_item.source_title == "Nayiri Entry"
+    assert external_item.context_snippet == "Հայաստան արտաքին ապացույց"
+
+
+def test_word_check_includes_trusted_external_flags(db_session) -> None:
+    _seed_workspace(db_session)
+    provider = StubExternalProvider(
+        items=[
+            ExternalEvidenceItem(
+                provider_key="nayiri_web",
+                provider_display_name="Nayiri",
+                matched_form="Հայաստան",
+                normalized_form="հայաստան",
+                source_title="Nayiri Entry",
+                snippet="Հայաստան արտաքին ապացույց",
+                reference_link="https://example.test/nayiri/1",
+                match_type=ReferenceMatchType.NORMALIZED,
+            )
+        ]
+    )
+    _, word_search_service = _build_word_services(provider)
+
+    response = asyncio.run(
+        check_word(
+            q="Հայաստան",
+            include_external=True,
+            provider_keys=None,
+            current_user=_current_user(),
+            session=db_session,
+            word_search_service=word_search_service,
+        )
+    )
+
+    assert response.exists_in_lexicon is True
+    assert response.found_in_trusted_external is True
+    assert response.trusted_external_status is TrustedExternalLookupStatus.COMPLETED
+    assert response.trusted_external_match_count == 1
+    assert response.trusted_external_sources[0].provider_display_name == "Nayiri"
+    assert response.trusted_external_sources[0].matched_form == "Հայաստան"
+
+
+def test_external_provider_failure_does_not_break_internal_search(db_session) -> None:
+    _seed_workspace(db_session)
+    provider = StubExternalProvider(error=ExternalLookupProviderError("temporary provider failure"))
+    _, word_search_service = _build_word_services(provider)
+
+    response = asyncio.run(
+        search_words(
+            q="Հայաստան",
+            mode=WordSearchMode.NORMALIZED,
+            include_categories=[
+                WordSearchCategory.LEXICON,
+                WordSearchCategory.IMPORTED_BOOKS,
+                WordSearchCategory.REFERENCE_SOURCES,
+                WordSearchCategory.TRUSTED_EXTERNAL,
+            ],
+            include_external=False,
+            provider_keys=None,
+            limit_per_category=20,
+            current_user=_current_user(),
+            session=db_session,
+            word_search_service=word_search_service,
+        )
+    )
+
+    groups = {group.category: group for group in response.groups}
+    assert groups[WordSearchCategory.LEXICON].total >= 1
+    assert groups[WordSearchCategory.IMPORTED_BOOKS].total >= 1
+    assert groups[WordSearchCategory.REFERENCE_SOURCES].total >= 1
+    assert groups[WordSearchCategory.TRUSTED_EXTERNAL].total == 0
+    assert groups[WordSearchCategory.TRUSTED_EXTERNAL].status is TrustedExternalLookupStatus.UNAVAILABLE
 
 
 def test_new_word_endpoints_are_user_scoped(db_session) -> None:

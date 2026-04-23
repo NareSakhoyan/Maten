@@ -1,6 +1,6 @@
 # Armenian Historical Books OCR Backend
 
-MVP-3 backend for authenticated uploads, page-by-page text extraction, OCR fallback with `pytesseract`, Armenian line-break reconstruction before tokenization, raw word-occurrence indexing, reviewer-centric lexicon discovery, curated lexeme management, personal reference-source matching, source-first reference-entry review, and backend-defined long-running job progress tracking against Supabase Postgres and Storage.
+MVP-4 backend for authenticated uploads, page-by-page text extraction, OCR fallback with `pytesseract`, Armenian line-break reconstruction before tokenization, raw word-occurrence indexing, reviewer-centric lexicon discovery, curated lexeme management, personal reference-source matching, source-first reference-entry review, backend-only trusted external word lookup through a Nayiri web provider abstraction, and backend-defined long-running job progress tracking against Supabase Postgres and Storage.
 
 ## Stack
 
@@ -251,10 +251,12 @@ python -m app.scripts.reprocess_document <document_id>
     Reference sources expose `/api/v1/reference-sources/{source_id}/word-candidates`, and that response is anchored by the selected source rather than by a corpus-global result list.
 
 11. Open an evidence-first drawer payload with `/api/v1/word-evidence`.
-    The response consolidates traceable evidence rows across imported books, reference sources, and lexicon items for a normalized form.
+    The response consolidates traceable internal evidence rows across imported books, reference sources, and lexicon items for a normalized form.
+    When `include_external=true`, it also returns trusted external evidence in a separate `external_evidence_items` array with provider labels, links, snippets, and cache metadata.
 
 12. Search words globally with `/api/v1/words/search` and perform a quick lexicon existence check with `/api/v1/words/check`.
-    Search groups results by `lexicon`, `imported_books`, and `reference_sources`.
+    Search groups results by `lexicon`, `imported_books`, `reference_sources`, and optional `trusted_external`.
+    Quick word check can optionally include trusted external presence flags and an external status when `include_external=true`.
 
 13. Check a single group or lexeme on demand with `/api/v1/lexicon/groups/{normalized_form}/reference-matches` or `/api/v1/lexemes/{lexeme_id}/reference-matches`.
     Matching supports exact, normalized, and conservative fuzzy checks.
@@ -352,20 +354,52 @@ python -m app.scripts.reprocess_document <document_id>
 ## Word Evidence
 
 - `/api/v1/word-evidence` is the reusable drawer/detail payload for a normalized form
-- evidence rows are unified across imported books, reference sources, and lexicon items
+- internal evidence rows are unified across imported books, reference sources, and lexicon items
 - every evidence item includes a traceable source identity, a human-readable source title, and route-hint/reference metadata where practical
 - imported-book evidence includes page number, context snippet, extraction method, and occurrence id
 - reference-source evidence includes source title, route hint, and import provenance metadata
 - lexicon evidence includes the curated lexeme identity and optional occurrence-backed context when available
+- trusted external evidence is optional and returned separately from internal evidence so provenance stays explicit
+- trusted external evidence includes provider labels, matched forms, source titles, snippets when available, reference links, match type, match score, fetched timestamps, and an external status summary
 - evidence payloads also expose linked lexeme summaries and related reference-match summaries when they exist
 
 ## Global Word Search
 
 - `/api/v1/words/search` is now the main cross-source lookup entry point
-- search groups results by `lexicon`, `imported_books`, and `reference_sources`
+- search groups results by `lexicon`, `imported_books`, `reference_sources`, and optional `trusted_external`
 - search modes include `exact`, `normalized`, and conservative `fuzzy`
-- `/api/v1/words/check` provides a lightweight "does this already exist?" lexicon check with optional imported-book and reference-source presence flags
+- `trusted_external` is opt-in through `include_categories=trusted_external` or `include_external=true`
+- trusted-external groups expose `completed`, `no_results`, or `unavailable` status without breaking internal results
+- `/api/v1/words/check` provides a lightweight "does this already exist?" lexicon check with optional imported-book, reference-source, and trusted-external presence flags plus `trusted_external_status`
 - search prioritizes precision and traceability over broad recall
+
+## Trusted External Lookup
+
+- MVP-4 adds a trusted external lookup layer for words without turning the product into broad internet search
+- external lookup is assistive evidence only; it does not create lexemes, mark words resolved, or make automatic lexical decisions
+- the first provider is `nayiri_web`, a backend-only web adapter that fetches and parses Nayiri HTML on the server
+- the frontend must never call Nayiri directly; all Nayiri access stays inside the backend provider module
+- trusted external lookups are cached in `external_lookup_cache` and `external_lookup_results` so repeated searches do not re-fetch every time
+- successful empty lookups are cached separately from provider failures, so `no_results` and `unavailable` stay distinct
+- every external result must stay traceable and provider-labeled, with as much of the following as the provider exposes:
+  - provider display name
+  - matched form
+  - source title
+  - snippet
+  - reference link
+  - match type
+  - match score
+- provider failures fail gracefully and do not block internal search or internal evidence responses
+- Nayiri lookup uses server-side throttling, bounded HTTP timeouts, and conservative HTML parsing that prefers dropping uncertain rows over returning noisy garbage
+- parser tests use saved HTML fixtures rather than live network calls
+- minimal external lookup configuration lives in `.env`:
+  - `EXTERNAL_LOOKUP_ENABLED`
+  - `EXTERNAL_LOOKUP_CACHE_TTL_HOURS`
+  - `EXTERNAL_LOOKUP_HTTP_TIMEOUT_SECONDS`
+  - `NAYIRI_PROVIDER_ENABLED`
+  - `NAYIRI_PROVIDER_BASE_URL`
+  - `NAYIRI_PROVIDER_RATE_LIMIT_MS`
+- broad web search, meaning generation, and automatic lexical decisions are still out of scope for MVP-4
 
 ## Ingestion Failure Recovery
 
@@ -389,6 +423,9 @@ python -m app.scripts.reprocess_document <document_id>
 - `reference_sources` and `reference_entries` store personal imported or manual lookup material for each user.
 - `reference_sources` also store last import metadata such as import method, warning text, import timestamp, and current entry count.
 - `reference_source_imports` store per-import status, progress, counters, warnings, and completion state for individual reference import runs.
+- `external_providers` stores the trusted external provider registry used by the backend.
+- `external_lookup_cache` stores cache rows for trusted external lookups, including search mode, status, fetch time, and expiry.
+- `external_lookup_results` stores traceable cached external evidence items with matched form, source title, snippet, reference link, and provider metadata.
 - `reference_match_runs` now also store `matching_direction`, optional `source_id`, optional `target_scope`, and matched/unmatched summary counts for the completed run.
 - `reference_matches` store assistive match results for lexicon groups and lexemes; they do not replace curation.
 - `reference_match_run_results` store one run-scoped summary row per source entry for source-first runs, with lexicon and imported-book evidence summaries kept on the row for direct matched/unmatched review.
@@ -409,9 +446,9 @@ python -m app.scripts.reprocess_document <document_id>
 - OCR page images are uploaded to `page-images`, original files to `book-originals`, and OCR sidecar JSON to `ocr-json`.
 - PDFs use direct text extraction first. Pages without a usable text layer fall back to OCR.
 - Group detail evidence includes human-readable document titles alongside internal document IDs and page numbers.
-- MVP-3 does not implement internet search, meaning generation, external semantic enrichment, lemma generation, or automatic semantic merge/unmerge.
+- MVP-4 does not implement broad internet search, meaning generation, external semantic enrichment beyond trusted traceable lookups, lemma generation, or automatic semantic merge/unmerge.
 - Reference import is still a lightweight wordlist-style ingestion path. It does not implement full structured dictionary parsing, scholarly multi-column layout understanding, or automatic extraction of dictionary articles and definitions.
-- This refinement still does not implement morphology-aware automatic merge suggestions, Nayiri lookup, or automatic resolution based on a reference hit.
+- This refinement still does not implement morphology-aware automatic merge suggestions or automatic resolution based on a trusted external hit.
 - Advanced linguistic validation and cross-page continuation handling are intentionally out of scope; only obvious same-page Armenian hyphenated line breaks are reconstructed now.
 
 ## Tests

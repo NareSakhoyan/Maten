@@ -8,15 +8,18 @@ from sqlalchemy.orm import Session
 
 from app.db.models import Document, Lexeme, LexemeForm, Occurrence, ReferenceEntry, ReferenceSource
 from app.schemas.word import (
+    TrustedExternalWordCheckSource,
     WordCheckLexeme,
     WordCheckResponse,
     WordEvidenceItem,
-    WordEvidenceSourceType,
+    TrustedExternalLookupStatus,
     WordSearchCategory,
     WordSearchMode,
     WordSearchResponse,
     WordSearchResultGroup,
+    WordEvidenceSourceType,
 )
+from app.services.external_lookup_service import ExternalLookupBatch, ExternalLookupService, get_external_lookup_service
 from app.services.word_evidence_service import WordEvidenceService, get_word_evidence_service
 from app.utils.text_normalization import normalize_token
 
@@ -26,8 +29,14 @@ FUZZY_FORM_LIMIT = 5
 
 
 class WordSearchService:
-    def __init__(self, *, word_evidence_service: WordEvidenceService | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        word_evidence_service: WordEvidenceService | None = None,
+        external_lookup_service: ExternalLookupService | None = None,
+    ) -> None:
         self.word_evidence_service = word_evidence_service or get_word_evidence_service()
+        self.external_lookup_service = external_lookup_service or get_external_lookup_service()
 
     def search(
         self,
@@ -36,36 +45,39 @@ class WordSearchService:
         user_id: UUID,
         query: str,
         mode: WordSearchMode,
-        include_categories: list[WordSearchCategory],
+        include_categories: list[WordSearchCategory] | None,
+        include_external: bool = False,
+        provider_keys: list[str] | None = None,
         limit_per_category: int,
     ) -> WordSearchResponse:
         normalized_query = normalize_token(query)
         if not normalized_query:
             raise ValueError("q must not be empty.")
 
-        categories = include_categories or [
+        categories = include_categories if include_categories is not None else [
             WordSearchCategory.LEXICON,
             WordSearchCategory.IMPORTED_BOOKS,
             WordSearchCategory.REFERENCE_SOURCES,
         ]
+        if include_external and WordSearchCategory.TRUSTED_EXTERNAL not in categories:
+            categories = [*categories, WordSearchCategory.TRUSTED_EXTERNAL]
         groups: list[WordSearchResultGroup] = []
         for category in categories:
-            if category is WordSearchCategory.EXTERNAL_SOURCES:
-                groups.append(WordSearchResultGroup(category=category, items=[], total=0))
-                continue
-            items = self._category_items(
+            items, external_status = self._category_items(
                 session,
                 user_id=user_id,
                 query=query.strip(),
                 normalized_query=normalized_query,
                 category=category,
                 mode=mode,
+                provider_keys=provider_keys,
             )
             groups.append(
                 WordSearchResultGroup(
                     category=category,
                     items=items[:limit_per_category],
                     total=len(items),
+                    status=external_status,
                 )
             )
         return WordSearchResponse(
@@ -81,6 +93,8 @@ class WordSearchService:
         *,
         user_id: UUID,
         query: str,
+        include_external: bool = False,
+        provider_keys: list[str] | None = None,
     ) -> WordCheckResponse:
         normalized_query = normalize_token(query)
         if not normalized_query:
@@ -105,6 +119,13 @@ class WordSearchService:
                 .order_by(Lexeme.created_at.asc(), Lexeme.id.asc())
             )
         )
+        trusted_external_batch = self.external_lookup_service.lookup(
+            session,
+            user_id=user_id,
+            query=query.strip(),
+            mode=WordSearchMode.NORMALIZED,
+            provider_keys=provider_keys,
+        ) if include_external else ExternalLookupBatch(items=[], status=TrustedExternalLookupStatus.UNAVAILABLE)
         return WordCheckResponse(
             query=query.strip(),
             normalized_query=normalized_query,
@@ -138,6 +159,17 @@ class WordSearchService:
                     )
                 )
             ),
+            found_in_trusted_external=bool(trusted_external_batch.items),
+            trusted_external_status=trusted_external_batch.status if include_external else None,
+            trusted_external_match_count=len(trusted_external_batch.items),
+            trusted_external_sources=[
+                TrustedExternalWordCheckSource(
+                    provider_display_name=item.provider_display_name,
+                    matched_form=item.matched_form,
+                    reference_link=item.reference_link,
+                )
+                for item in trusted_external_batch.items
+            ],
         )
 
     def _category_items(
@@ -149,7 +181,18 @@ class WordSearchService:
         normalized_query: str,
         category: WordSearchCategory,
         mode: WordSearchMode,
-    ) -> list[WordEvidenceItem]:
+        provider_keys: list[str] | None = None,
+    ) -> tuple[list[WordEvidenceItem], TrustedExternalLookupStatus | None]:
+        if category is WordSearchCategory.TRUSTED_EXTERNAL:
+            return self._trusted_external_items(
+                session,
+                user_id=user_id,
+                query=query,
+                normalized_query=normalized_query,
+                mode=mode,
+                provider_keys=provider_keys,
+            )
+
         if mode is WordSearchMode.FUZZY:
             normalized_forms = self._fuzzy_forms_for_category(
                 session,
@@ -204,7 +247,54 @@ class WordSearchService:
                 str(item.occurrence_id or item.lexeme_id or item.source_id),
             )
         )
-        return items
+        return items, None
+
+    def _trusted_external_items(
+        self,
+        session: Session,
+        *,
+        user_id: UUID,
+        query: str,
+        normalized_query: str,
+        mode: WordSearchMode,
+        provider_keys: list[str] | None,
+    ) -> tuple[list[WordEvidenceItem], TrustedExternalLookupStatus]:
+        batch = self.external_lookup_service.lookup(
+            session,
+            user_id=user_id,
+            query=query,
+            mode=mode,
+            provider_keys=provider_keys,
+        )
+        result_items = [
+            WordEvidenceItem(
+                word_form=item.matched_form,
+                matched_form=item.matched_form,
+                normalized_form=item.normalized_form or normalized_query,
+                source_type=WordEvidenceSourceType.TRUSTED_EXTERNAL,
+                source_id=item.provider_key,
+                source_title=item.source_title or item.provider_display_name,
+                source_subtitle=item.source_subtitle,
+                context_snippet=item.snippet,
+                reference_link=item.reference_link,
+                provider_key=item.provider_key,
+                provider_display_name=item.provider_display_name,
+                match_type=item.match_type,
+                match_score=item.match_score,
+                fetched_at=item.fetched_at,
+                created_at=item.created_at or item.fetched_at,
+            )
+            for item in batch.items
+        ]
+        result_items.sort(
+            key=lambda item: (
+                item.provider_display_name or "",
+                item.source_title,
+                item.word_form,
+                item.reference_link or "",
+            )
+        )
+        return result_items, batch.status
 
     def _fuzzy_forms_for_category(
         self,

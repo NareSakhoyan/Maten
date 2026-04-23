@@ -10,6 +10,7 @@ from app.db.models import OccurrenceScriptType
 from app.schemas.common import APIModel, OffsetPagination
 from app.schemas.lexicon import LexiconGroupState
 from app.schemas.reference import ReferenceMatchBest
+from app.db.models import ReferenceMatchType
 from app.schemas.reference_enums import SupportedReferenceImportMethod
 
 
@@ -17,20 +18,28 @@ class WordEvidenceSourceType(str, enum.Enum):
     IMPORTED_BOOK = "imported_book"
     REFERENCE_SOURCE = "reference_source"
     LEXICON = "lexicon"
-    EXTERNAL_REFERENCE = "external_reference"
+    TRUSTED_EXTERNAL = "trusted_external"
+    EXTERNAL_REFERENCE = "trusted_external"
 
 
 class WordSearchCategory(str, enum.Enum):
     LEXICON = "lexicon"
     IMPORTED_BOOKS = "imported_books"
     REFERENCE_SOURCES = "reference_sources"
-    EXTERNAL_SOURCES = "external_sources"
+    TRUSTED_EXTERNAL = "trusted_external"
+    EXTERNAL_SOURCES = "trusted_external"
 
 
 class WordSearchMode(str, enum.Enum):
     EXACT = "exact"
     NORMALIZED = "normalized"
     FUZZY = "fuzzy"
+
+
+class TrustedExternalLookupStatus(str, enum.Enum):
+    COMPLETED = "completed"
+    NO_RESULTS = "no_results"
+    UNAVAILABLE = "unavailable"
 
 
 class SourceWordStatusView(str, enum.Enum):
@@ -62,6 +71,12 @@ class WordEvidenceItem(APIModel):
     source_warning: str | None = None
     is_suspicious: bool = False
     suspicion_reasons: list[str] = Field(default_factory=list)
+    matched_form: str | None = None
+    provider_key: str | None = None
+    provider_display_name: str | None = None
+    match_type: ReferenceMatchType | None = None
+    match_score: float | None = None
+    fetched_at: datetime | None = None
     created_at: datetime | None = None
 
 
@@ -69,6 +84,7 @@ class WordSearchResultGroup(APIModel):
     category: WordSearchCategory
     items: list[WordEvidenceItem]
     total: int
+    status: TrustedExternalLookupStatus | None = None
 
 
 class WordSearchResponse(APIModel):
@@ -92,10 +108,18 @@ class WordEvidenceSummary(APIModel):
     linked_lexeme_canonical_form: str | None = None
 
 
+class WordEvidenceExternalSummary(APIModel):
+    total_hits: int
+    provider_count: int
+    status: TrustedExternalLookupStatus
+
+
 class WordEvidenceResponse(OffsetPagination):
     normalized_form: str
     summary: WordEvidenceSummary
     evidence_items: list[WordEvidenceItem]
+    external_summary: WordEvidenceExternalSummary | None = None
+    external_evidence_items: list[WordEvidenceItem] = Field(default_factory=list)
     related_reference_matches: list[ReferenceMatchBest] | None = None
     related_lexeme_summary: RelatedLexemeSummary | None = None
 
@@ -167,6 +191,12 @@ class WordCheckLexeme(APIModel):
     canonical_normalized_form: str
 
 
+class TrustedExternalWordCheckSource(APIModel):
+    provider_display_name: str
+    matched_form: str
+    reference_link: str | None = None
+
+
 class WordCheckResponse(APIModel):
     query: str
     normalized_query: str
@@ -175,3 +205,7 @@ class WordCheckResponse(APIModel):
     matching_lexemes: list[WordCheckLexeme]
     found_in_imported_books: bool = False
     found_in_reference_sources: bool = False
+    found_in_trusted_external: bool = False
+    trusted_external_status: TrustedExternalLookupStatus | None = None
+    trusted_external_match_count: int = 0
+    trusted_external_sources: list[TrustedExternalWordCheckSource] = Field(default_factory=list)

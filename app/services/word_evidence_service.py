@@ -10,19 +10,29 @@ from app.db.models import Document, DocumentPage, Lexeme, LexemeForm, Occurrence
 from app.schemas.reference import ReferenceMatchBest
 from app.schemas.word import (
     RelatedLexemeSummary,
+    TrustedExternalLookupStatus,
     WordEvidenceItem,
+    WordEvidenceExternalSummary,
     WordEvidenceResponse,
     WordEvidenceSourceType,
+    WordSearchMode,
     WordEvidenceSummary,
 )
+from app.services.external_lookup_service import ExternalLookupBatch, ExternalLookupService, get_external_lookup_service
 from app.services.reference_matching_service import ReferenceMatchingService, get_reference_matching_service
 from app.utils.text_normalization import normalize_token
 from app.utils.token_classification import classify_token, is_suspicious_script_type, suspicion_reasons_for_script_type
 
 
 class WordEvidenceService:
-    def __init__(self, *, reference_matching_service: ReferenceMatchingService | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        reference_matching_service: ReferenceMatchingService | None = None,
+        external_lookup_service: ExternalLookupService | None = None,
+    ) -> None:
         self.reference_matching_service = reference_matching_service or get_reference_matching_service()
+        self.external_lookup_service = external_lookup_service or get_external_lookup_service()
 
     def get_word_evidence(
         self,
@@ -32,6 +42,8 @@ class WordEvidenceService:
         normalized_form: str,
         source_type: WordEvidenceSourceType | None = None,
         source_id: str | None = None,
+        include_external: bool = False,
+        provider_keys: list[str] | None = None,
         limit: int,
         offset: int,
     ) -> WordEvidenceResponse:
@@ -72,6 +84,18 @@ class WordEvidenceService:
                 )
             )
 
+        external_batch = ExternalLookupBatch(items=[], status=TrustedExternalLookupStatus.UNAVAILABLE)
+        external_evidence_items: list[WordEvidenceItem] = []
+        external_requested = include_external or source_type is WordEvidenceSourceType.TRUSTED_EXTERNAL
+        if external_requested:
+            external_batch = self.external_evidence(
+                session,
+                user_id=user_id,
+                normalized_form=normalized,
+                provider_keys=[source_id] if source_type is WordEvidenceSourceType.TRUSTED_EXTERNAL and source_id else provider_keys,
+            )
+            external_evidence_items = external_batch.items
+
         evidence_items.sort(
             key=lambda item: (
                 item.source_type.value,
@@ -102,6 +126,12 @@ class WordEvidenceService:
                 ),
             ),
             evidence_items=paged_items,
+            external_summary=WordEvidenceExternalSummary(
+                total_hits=len(external_evidence_items),
+                provider_count=len({item.provider_key for item in external_evidence_items if item.provider_key}),
+                status=external_batch.status,
+            ) if external_requested else None,
+            external_evidence_items=external_evidence_items,
             related_reference_matches=related_reference_matches or None,
             related_lexeme_summary=related_lexeme_summary,
             total=total_hits,
@@ -343,6 +373,52 @@ class WordEvidenceService:
                 )
             )
         return items
+
+    def external_evidence(
+        self,
+        session: Session,
+        *,
+        user_id: UUID,
+        normalized_form: str,
+        provider_keys: list[str] | None = None,
+    ) -> ExternalLookupBatch:
+        batch = self.external_lookup_service.lookup(
+            session,
+            user_id=user_id,
+            query=normalized_form,
+            mode=WordSearchMode.NORMALIZED,
+            provider_keys=provider_keys,
+        )
+        evidence_items = [
+            WordEvidenceItem(
+                word_form=item.matched_form,
+                matched_form=item.matched_form,
+                normalized_form=item.normalized_form or normalized_form,
+                source_type=WordEvidenceSourceType.TRUSTED_EXTERNAL,
+                source_id=item.provider_key,
+                source_title=item.source_title or item.provider_display_name,
+                source_subtitle=item.source_subtitle,
+                page_number=None,
+                context_snippet=item.snippet,
+                reference_link=item.reference_link,
+                provider_key=item.provider_key,
+                provider_display_name=item.provider_display_name,
+                match_type=item.match_type,
+                match_score=item.match_score,
+                fetched_at=item.fetched_at,
+                created_at=item.created_at or item.fetched_at,
+            )
+            for item in batch.items
+        ]
+        evidence_items.sort(
+            key=lambda item: (
+                item.provider_display_name or "",
+                item.source_title,
+                item.word_form,
+                item.reference_link or "",
+            )
+        )
+        return ExternalLookupBatch(items=evidence_items, status=batch.status)
 
     def _related_reference_matches(
         self,

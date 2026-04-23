@@ -69,6 +69,27 @@ class Settings(BaseSettings):
     reference_import_max_line_length: int = Field(default=120, alias="REFERENCE_IMPORT_MAX_LINE_LENGTH")
     reference_pdf_text_min_length: int = Field(default=40, alias="REFERENCE_PDF_TEXT_MIN_LENGTH")
     reference_fuzzy_threshold_default: int = Field(default=90, alias="REFERENCE_FUZZY_THRESHOLD_DEFAULT")
+    external_lookup_enabled: bool = Field(default=True, alias="EXTERNAL_LOOKUP_ENABLED")
+    external_lookup_cache_ttl_hours: int = Field(
+        default=24,
+        alias="EXTERNAL_LOOKUP_CACHE_TTL_HOURS",
+        ge=0,
+    )
+    external_lookup_http_timeout_seconds: float = Field(
+        default=10.0,
+        alias="EXTERNAL_LOOKUP_HTTP_TIMEOUT_SECONDS",
+        gt=0,
+    )
+    nayiri_provider_enabled: bool = Field(default=True, alias="NAYIRI_PROVIDER_ENABLED")
+    nayiri_provider_base_url: str = Field(
+        default="http://www.nayiri.com/search",
+        alias="NAYIRI_PROVIDER_BASE_URL",
+    )
+    nayiri_provider_rate_limit_ms: int = Field(
+        default=500,
+        alias="NAYIRI_PROVIDER_RATE_LIMIT_MS",
+        ge=0,
+    )
 
     @field_validator("database_url", mode="before")
     @classmethod
@@ -86,6 +107,13 @@ class Settings(BaseSettings):
     @field_validator("supabase_url", mode="before")
     @classmethod
     def normalize_supabase_url(cls, value: str) -> str:
+        if not isinstance(value, str):
+            return value
+        return value.strip().strip('"').strip("'").rstrip("/")
+
+    @field_validator("nayiri_provider_base_url", mode="before")
+    @classmethod
+    def normalize_nayiri_base_url(cls, value: str) -> str:
         if not isinstance(value, str):
             return value
         return value.strip().strip('"').strip("'").rstrip("/")

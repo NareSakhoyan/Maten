@@ -147,6 +147,17 @@ class JobResultResourceType(str, enum.Enum):
     REFERENCE_MATCH_RUN = "reference_match_run"
 
 
+class ExternalLookupSearchMode(str, enum.Enum):
+    EXACT = "exact"
+    NORMALIZED = "normalized"
+    FUZZY = "fuzzy"
+
+
+class ExternalLookupStatus(str, enum.Enum):
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
 class Document(UpdatedTimestampMixin, Base):
     __tablename__ = "documents"
 
@@ -849,6 +860,121 @@ class ReferenceSourceImport(UpdatedTimestampMixin, Base):
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     source: Mapped["ReferenceSource"] = relationship(back_populates="imports")
+
+
+class ExternalProvider(UpdatedTimestampMixin, Base):
+    __tablename__ = "external_providers"
+    __table_args__ = (
+        UniqueConstraint("key", name="uq_external_providers_key"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    key: Mapped[str] = mapped_column(Text, nullable=False)
+    display_name: Mapped[str] = mapped_column(Text, nullable=False)
+    is_active: Mapped[bool] = mapped_column(nullable=False, default=True)
+
+    caches: Mapped[list["ExternalLookupCache"]] = relationship(
+        back_populates="provider",
+        cascade="all, delete-orphan",
+        order_by="ExternalLookupCache.created_at.desc()",
+    )
+    results: Mapped[list["ExternalLookupResult"]] = relationship(
+        back_populates="provider",
+        cascade="all, delete-orphan",
+        order_by="ExternalLookupResult.created_at.desc()",
+    )
+
+
+class ExternalLookupCache(TimestampMixin, Base):
+    __tablename__ = "external_lookup_cache"
+    __table_args__ = (
+        Index("ix_external_lookup_cache_provider_id", "provider_id"),
+        Index("ix_external_lookup_cache_normalized_query", "normalized_query"),
+        Index(
+            "ix_external_lookup_cache_provider_query_mode",
+            "provider_id",
+            "normalized_query",
+            "search_mode",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    provider_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("external_providers.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    query_text: Mapped[str] = mapped_column(Text, nullable=False)
+    normalized_query: Mapped[str] = mapped_column(Text, nullable=False)
+    search_mode: Mapped[ExternalLookupSearchMode] = mapped_column(
+        SqlEnum(
+            ExternalLookupSearchMode,
+            name="external_lookup_search_mode",
+            values_callable=enum_values,
+            validate_strings=True,
+        ),
+        nullable=False,
+    )
+    status: Mapped[ExternalLookupStatus] = mapped_column(
+        SqlEnum(
+            ExternalLookupStatus,
+            name="external_lookup_status",
+            values_callable=enum_values,
+            validate_strings=True,
+        ),
+        nullable=False,
+    )
+    fetched_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    provider: Mapped["ExternalProvider"] = relationship(back_populates="caches")
+    results: Mapped[list["ExternalLookupResult"]] = relationship(
+        back_populates="cache",
+        cascade="all, delete-orphan",
+        order_by="ExternalLookupResult.created_at.asc()",
+    )
+
+
+class ExternalLookupResult(TimestampMixin, Base):
+    __tablename__ = "external_lookup_results"
+    __table_args__ = (
+        Index("ix_external_lookup_results_cache_id", "cache_id"),
+        Index("ix_external_lookup_results_provider_id", "provider_id"),
+        Index("ix_external_lookup_results_normalized_form", "normalized_form"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    cache_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("external_lookup_cache.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    provider_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("external_providers.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    matched_form: Mapped[str] = mapped_column(Text, nullable=False)
+    normalized_form: Mapped[str | None] = mapped_column(Text, nullable=True)
+    source_title: Mapped[str | None] = mapped_column(Text, nullable=True)
+    source_subtitle: Mapped[str | None] = mapped_column(Text, nullable=True)
+    snippet: Mapped[str | None] = mapped_column(Text, nullable=True)
+    reference_link: Mapped[str | None] = mapped_column(Text, nullable=True)
+    metadata_json: Mapped[dict[str, object] | None] = mapped_column(JSON, nullable=True)
+    match_type: Mapped[ReferenceMatchType] = mapped_column(
+        SqlEnum(
+            ReferenceMatchType,
+            name="reference_match_type",
+            values_callable=enum_values,
+            validate_strings=True,
+        ),
+        nullable=False,
+    )
+    match_score: Mapped[float | None] = mapped_column(Numeric(5, 2), nullable=True)
+
+    cache: Mapped["ExternalLookupCache"] = relationship(back_populates="results")
+    provider: Mapped["ExternalProvider"] = relationship(back_populates="results")
 
 
 class JobStageEvent(TimestampMixin, Base):
