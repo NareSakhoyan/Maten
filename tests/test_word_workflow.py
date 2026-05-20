@@ -228,6 +228,7 @@ def test_document_word_candidates_endpoint_and_document_summary(db_session) -> N
         list_document_word_candidates(
             document_id=document.id,
             search=None,
+            word_filter="all",
             status_view=SourceWordStatusView.ALL,
             reference_status=ReferenceStatusFilter.ALL,
             limit=20,

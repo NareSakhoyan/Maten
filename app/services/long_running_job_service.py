@@ -5,14 +5,21 @@ from uuid import UUID
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from app.db.models import IngestionJob, JobKind, MorphologyRun, ReferenceMatchRun, ReferenceSourceImport
+from app.db.models import (
+    DocumentNayiriLookupRun,
+    IngestionJob,
+    JobKind,
+    MorphologyRun,
+    ReferenceMatchRun,
+    ReferenceSourceImport,
+)
 from app.schemas.job import LongRunningJobListResponse, LongRunningJobRead
 
 
 class LongRunningJobService:
     def build_job_read(
         self,
-        job: IngestionJob | ReferenceSourceImport | ReferenceMatchRun | MorphologyRun,
+        job: IngestionJob | ReferenceSourceImport | ReferenceMatchRun | MorphologyRun | DocumentNayiriLookupRun,
         *,
         session: Session | None = None,
     ) -> LongRunningJobRead:
@@ -24,6 +31,8 @@ class LongRunningJobService:
             return self._build_reference_matching_job(session, job)
         if isinstance(job, MorphologyRun):
             return self._build_morphology_job(session, job)
+        if isinstance(job, DocumentNayiriLookupRun):
+            return self._build_nayiri_lookup_job(session, job)
         raise TypeError(f"Unsupported job type: {type(job)!r}")
 
     def get_user_job(self, session: Session, *, user_id: UUID, job_id: UUID) -> LongRunningJobRead | None:
@@ -42,6 +51,10 @@ class LongRunningJobService:
         morphology_run = session.get(MorphologyRun, job_id)
         if morphology_run is not None and morphology_run.user_id == str(user_id):
             return self._build_morphology_job(session, morphology_run)
+
+        nayiri_lookup_run = session.get(DocumentNayiriLookupRun, job_id)
+        if nayiri_lookup_run is not None and nayiri_lookup_run.user_id == str(user_id):
+            return self._build_nayiri_lookup_job(session, nayiri_lookup_run)
         return None
 
     def list_jobs(
@@ -95,6 +108,16 @@ class LongRunningJobService:
             jobs.extend(
                 self._build_morphology_job(session, job)
                 for job in session.scalars(select(MorphologyRun).where(*filters))
+            )
+
+        if job_kind in {None, JobKind.NAYIRI_TRUSTED_LOOKUP}:
+            filters = [DocumentNayiriLookupRun.user_id == str(user_id)]
+            if status:
+                filters.append(DocumentNayiriLookupRun.status == status)
+            total += session.scalar(select(func.count(DocumentNayiriLookupRun.id)).where(*filters)) or 0
+            jobs.extend(
+                self._build_nayiri_lookup_job(session, job)
+                for job in session.scalars(select(DocumentNayiriLookupRun).where(*filters))
             )
 
         jobs.sort(key=lambda item: (item.created_at, item.id), reverse=True)
@@ -155,6 +178,17 @@ class LongRunningJobService:
         )
         jobs.extend(self._build_morphology_job(session, job) for job in morphology_runs)
 
+        nayiri_lookup_runs = session.scalars(
+            select(DocumentNayiriLookupRun)
+            .where(
+                DocumentNayiriLookupRun.user_id == str(user_id),
+                DocumentNayiriLookupRun.status.in_(active_statuses),
+            )
+            .order_by(DocumentNayiriLookupRun.created_at.desc(), DocumentNayiriLookupRun.id.desc())
+            .limit(per_kind_limit)
+        )
+        jobs.extend(self._build_nayiri_lookup_job(session, job) for job in nayiri_lookup_runs)
+
         jobs.sort(key=lambda item: (item.created_at, item.id), reverse=True)
         return jobs[:limit]
 
@@ -185,9 +219,21 @@ class LongRunningJobService:
                 MorphologyRun.status.in_(active_statuses),
             )
         ).scalar_subquery()
+        nayiri_lookup_count = (
+            select(func.count(DocumentNayiriLookupRun.id)).where(
+                DocumentNayiriLookupRun.user_id == user_id_text,
+                DocumentNayiriLookupRun.status.in_(active_statuses),
+            )
+        ).scalar_subquery()
 
         total = session.scalar(
-            select(ingestion_count + reference_import_count + reference_matching_count + morphology_count)
+            select(
+                ingestion_count
+                + reference_import_count
+                + reference_matching_count
+                + morphology_count
+                + nayiri_lookup_count
+            )
         )
         return total or 0
 
@@ -301,6 +347,36 @@ class LongRunningJobService:
             can_retry=job.can_retry,
             latest_retry_job_id=latest_retry_job_id,
             latest_retry_job_status=latest_retry_job_status,
+            current_stage_code=job.current_stage_code,
+            current_stage_label=job.current_stage_label,
+            stage_message_user=job.stage_message_user,
+            progress_percent=job.progress_percent,
+            items_processed=job.items_processed,
+            items_total=job.items_total,
+            error_code=job.error_code,
+            error_message_user=job.error_message_user or job.error_message,
+            next_steps=job.next_steps,
+            result_resource_type=job.result_resource_type,
+            result_resource_id=job.result_resource_id,
+            started_at=job.started_at,
+            finished_at=job.finished_at,
+            created_at=job.created_at,
+            updated_at=job.updated_at,
+        )
+
+    @staticmethod
+    def _build_nayiri_lookup_job(
+        session: Session | None,
+        job: DocumentNayiriLookupRun,
+    ) -> LongRunningJobRead:
+        return LongRunningJobRead(
+            id=job.id,
+            job_kind=JobKind.NAYIRI_TRUSTED_LOOKUP,
+            user_id=job.user_id,
+            status=job.status.value,
+            can_retry=job.can_retry,
+            latest_retry_job_id=None,
+            latest_retry_job_status=None,
             current_stage_code=job.current_stage_code,
             current_stage_label=job.current_stage_label,
             stage_message_user=job.stage_message_user,

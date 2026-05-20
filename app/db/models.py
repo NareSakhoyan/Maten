@@ -150,6 +150,7 @@ class JobKind(str, enum.Enum):
     REFERENCE_IMPORT = "reference_import"
     REFERENCE_MATCHING = "reference_matching"
     MORPHOLOGY = "morphology"
+    NAYIRI_TRUSTED_LOOKUP = "nayiri_trusted_lookup"
 
 
 class JobResultResourceType(str, enum.Enum):
@@ -222,6 +223,10 @@ class Document(UpdatedTimestampMixin, Base):
         cascade="all, delete-orphan",
     )
     morphology_runs: Mapped[list["MorphologyRun"]] = relationship(
+        back_populates="document",
+        cascade="all, delete-orphan",
+    )
+    nayiri_lookup_runs: Mapped[list["DocumentNayiriLookupRun"]] = relationship(
         back_populates="document",
         cascade="all, delete-orphan",
     )
@@ -678,6 +683,61 @@ class MorphologyRun(UpdatedTimestampMixin, Base):
 
     document: Mapped["Document | None"] = relationship(back_populates="morphology_runs")
     reference_source: Mapped["ReferenceSource | None"] = relationship(back_populates="morphology_runs")
+
+
+class DocumentNayiriLookupRun(UpdatedTimestampMixin, Base):
+    __tablename__ = "document_nayiri_lookup_runs"
+    __table_args__ = (Index("ix_document_nayiri_lookup_runs_user_id", "user_id"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id: Mapped[str] = mapped_column(Text, nullable=False)
+    document_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("documents.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    status: Mapped[MorphologyRunStatus] = mapped_column(
+        SqlEnum(
+            MorphologyRunStatus,
+            name="morphology_run_status",
+            values_callable=enum_values,
+            validate_strings=True,
+            create_constraint=False,
+        ),
+        nullable=False,
+        default=MorphologyRunStatus.QUEUED,
+    )
+    checked_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    skipped_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    current_stage_code: Mapped[str | None] = mapped_column(Text, nullable=True)
+    current_stage_label: Mapped[str | None] = mapped_column(Text, nullable=True)
+    stage_message_user: Mapped[str | None] = mapped_column(Text, nullable=True)
+    progress_percent: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    items_processed: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    items_total: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    error_code: Mapped[str | None] = mapped_column(Text, nullable=True)
+    error_message_user: Mapped[str | None] = mapped_column(Text, nullable=True)
+    next_steps: Mapped[list[str] | None] = mapped_column(JSON, nullable=True)
+    result_resource_type: Mapped[JobResultResourceType | None] = mapped_column(
+        SqlEnum(
+            JobResultResourceType,
+            name="job_result_resource_type",
+            values_callable=enum_values,
+            validate_strings=True,
+            create_constraint=False,
+        ),
+        nullable=True,
+    )
+    result_resource_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    retry_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    can_retry: Mapped[bool] = mapped_column(nullable=False, default=False)
+    last_retried_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    document: Mapped["Document"] = relationship(back_populates="nayiri_lookup_runs")
 
 
 class MorphologyAnalysis(UpdatedTimestampMixin, Base):

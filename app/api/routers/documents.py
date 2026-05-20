@@ -3,6 +3,8 @@ from __future__ import annotations
 from io import BytesIO
 from uuid import UUID
 
+from typing import Annotated
+
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
 from fastapi.responses import StreamingResponse
 from sqlalchemy import select
@@ -22,7 +24,12 @@ from app.schemas.workflow import DocumentWorkflowRead
 from app.schemas.morphology import DocumentMorphologySettingsResponse, MorphologyRunCreateRequest, MorphologySummaryResponse, MorphologySettingsUpdateRequest
 from app.schemas.page import DocumentPageListResponse
 from app.schemas.reference import ReferenceStatusFilter
-from app.schemas.word import DocumentWordCandidateListResponse, SourceWordStatusView
+from app.schemas.word import (
+    DocumentNayiriLookupRunStartResponse,
+    DocumentNayiriLookupSummary,
+    DocumentWordCandidateListResponse,
+    SourceWordStatusView,
+)
 from app.services.auth_service import AuthenticatedUser
 from app.services.document_service import DocumentService, get_document_service
 from app.services.document_workflow_service import DocumentWorkflowService, get_document_workflow_service
@@ -35,6 +42,11 @@ from app.services.lexicon_index_rebuild_service import (
     LexiconIndexRebuildService,
     get_lexicon_index_rebuild_service,
 )
+from app.services.document_nayiri_lookup_service import DocumentNayiriLookupService, get_document_nayiri_lookup_service
+from app.services.document_trusted_external_service import (
+    DocumentTrustedExternalService,
+    get_document_trusted_external_service,
+)
 from app.services.source_word_review_service import SourceWordReviewService, get_source_word_review_service
 from app.services.storage_service import StorageService, get_storage_service
 from app.schemas.lexicon import LexiconIndexRebuildResponse
@@ -44,6 +56,35 @@ from app.api.routers.morphology import start_morphology_run_or_raise
 
 
 router = APIRouter(prefix="/documents")
+
+
+def _resolve_document_word_candidate_filters(
+    *,
+    word_filter: str | None = None,
+    status_view: SourceWordStatusView | None = None,
+    reference_status: ReferenceStatusFilter | None = None,
+) -> tuple[SourceWordStatusView, ReferenceStatusFilter]:
+    if word_filter:
+        normalized = word_filter.strip().lower()
+        if normalized == "all":
+            return SourceWordStatusView.ALL, ReferenceStatusFilter.ALL
+        if normalized == "linked":
+            return SourceWordStatusView.LINKED, ReferenceStatusFilter.ALL
+        if normalized == "unlinked":
+            return SourceWordStatusView.UNLINKED, ReferenceStatusFilter.ALL
+        if normalized == "suspicious":
+            return SourceWordStatusView.SUSPICIOUS, ReferenceStatusFilter.ALL
+        if normalized == "ignored":
+            return SourceWordStatusView.IGNORED, ReferenceStatusFilter.ALL
+        if normalized == "matched":
+            return SourceWordStatusView.ALL, ReferenceStatusFilter.MATCHED
+        if normalized == "unmatched":
+            return SourceWordStatusView.ALL, ReferenceStatusFilter.UNMATCHED
+
+    return (
+        status_view or SourceWordStatusView.UNLINKED,
+        reference_status or ReferenceStatusFilter.ALL,
+    )
 
 
 @router.post("/upload", response_model=DocumentStartResponse, status_code=status.HTTP_201_CREATED)
@@ -272,8 +313,9 @@ async def get_document_page_image(
 async def list_document_word_candidates(
     document_id: UUID,
     search: str | None = Query(default=None),
-    status_view: SourceWordStatusView = Query(default=SourceWordStatusView.UNLINKED),
-    reference_status: ReferenceStatusFilter = Query(default=ReferenceStatusFilter.ALL),
+    word_filter: Annotated[str | None, Query(alias="filter")] = None,
+    status_view: Annotated[SourceWordStatusView | None, Query()] = None,
+    reference_status: Annotated[ReferenceStatusFilter | None, Query()] = None,
     limit: int = Query(default=20, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
     current_user: AuthenticatedUser = Depends(get_current_user),
@@ -288,17 +330,83 @@ async def list_document_word_candidates(
     )
     if document is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found.")
+    resolved_status_view, resolved_reference_status = _resolve_document_word_candidate_filters(
+        word_filter=word_filter,
+        status_view=status_view,
+        reference_status=reference_status,
+    )
     items, total = source_word_review_service.list_document_word_candidates(
         session,
         user_id=current_user.user_id,
         document=document,
         search=search,
-        status_view=status_view,
-        reference_status=reference_status,
+        status_view=resolved_status_view,
+        reference_status=resolved_reference_status,
         limit=limit,
         offset=offset,
     )
     return DocumentWordCandidateListResponse(items=items, total=total, limit=limit, offset=offset)
+
+
+@router.get("/{document_id}/trusted-lookups/nayiri/summary", response_model=DocumentNayiriLookupSummary)
+async def get_document_nayiri_lookup_summary(
+    document_id: UUID,
+    current_user: AuthenticatedUser = Depends(get_current_user),
+    session: Session = Depends(get_db_session),
+    document_service: DocumentService = Depends(get_document_service),
+    document_trusted_external_service: DocumentTrustedExternalService = Depends(get_document_trusted_external_service),
+) -> DocumentNayiriLookupSummary:
+    document = document_service.get_user_document(
+        session,
+        user_id=current_user.user_id,
+        document_id=document_id,
+    )
+    if document is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found.")
+    summary = document_trusted_external_service.summarize_document(
+        session,
+        user_id=current_user.user_id,
+        document_id=document_id,
+    )
+    return DocumentNayiriLookupSummary(**summary)
+
+
+@router.post(
+    "/{document_id}/trusted-lookups/nayiri/run",
+    response_model=DocumentNayiriLookupRunStartResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def start_document_nayiri_lookup_run(
+    document_id: UUID,
+    current_user: AuthenticatedUser = Depends(get_current_user),
+    session: Session = Depends(get_db_session),
+    document_service: DocumentService = Depends(get_document_service),
+    document_nayiri_lookup_service: DocumentNayiriLookupService = Depends(get_document_nayiri_lookup_service),
+    long_running_job_service: LongRunningJobService = Depends(get_long_running_job_service),
+) -> DocumentNayiriLookupRunStartResponse:
+    document = document_service.get_user_document(
+        session,
+        user_id=current_user.user_id,
+        document_id=document_id,
+    )
+    if document is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found.")
+
+    try:
+        run = document_nayiri_lookup_service.start_document_run(
+            session,
+            user_id=current_user.user_id,
+            document_id=document_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+
+    job = long_running_job_service.build_job_read(run, session=session)
+    return DocumentNayiriLookupRunStartResponse(
+        message="Nayiri lookup queued for this document.",
+        run_id=run.id,
+        job_id=job.id,
+    )
 
 
 @router.post("/{document_id}/rebuild-index", response_model=LexiconIndexRebuildResponse)

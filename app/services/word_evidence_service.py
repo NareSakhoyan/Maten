@@ -95,6 +95,7 @@ class WordEvidenceService:
         external_batch = ExternalLookupBatch(items=[], status=TrustedExternalLookupStatus.UNAVAILABLE)
         external_evidence_items: list[WordEvidenceItem] = []
         external_requested = include_external or source_type is WordEvidenceSourceType.TRUSTED_EXTERNAL
+        best_external_canonical_form: str | None = None
         if external_requested:
             external_batch = self.external_evidence(
                 session,
@@ -103,6 +104,7 @@ class WordEvidenceService:
                 provider_keys=[source_id] if source_type is WordEvidenceSourceType.TRUSTED_EXTERNAL and source_id else provider_keys,
             )
             external_evidence_items = external_batch.items
+            best_external_canonical_form = self._best_external_canonical_form(external_batch)
 
         evidence_items.sort(
             key=lambda item: (
@@ -132,7 +134,7 @@ class WordEvidenceService:
                 linked_lexeme_canonical_form=(
                     related_lexeme_summary.canonical_form if related_lexeme_summary is not None else None
                 ),
-                best_lemma=morphology_summary.best_lemma,
+                best_lemma=best_external_canonical_form or morphology_summary.best_lemma,
                 lemma_candidates=morphology_summary.lemma_candidates,
                 pos_candidates=morphology_summary.pos_candidates,
                 morphology_available=morphology_summary.morphology_available,
@@ -464,6 +466,24 @@ class WordEvidenceService:
         for item in related:
             unique[(item.source_display_name, item.matched_form, item.match_type.value, item.match_score)] = item
         return list(unique.values())
+
+    @staticmethod
+    def _best_external_canonical_form(batch: ExternalLookupBatch) -> str | None:
+        if not batch.items:
+            return None
+        ranked = sorted(
+            batch.items,
+            key=lambda item: (
+                0 if item.match_type is not None and item.match_type.value == "exact" else 1,
+                item.match_score is None,
+                -(item.match_score or 0),
+            ),
+        )
+        for item in ranked:
+            candidate = (item.matched_form or "").strip()
+            if candidate:
+                return candidate
+        return None
 
     @staticmethod
     def _related_lexeme_summary(session: Session, *, lexeme: Lexeme) -> RelatedLexemeSummary:

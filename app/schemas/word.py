@@ -42,6 +42,20 @@ class TrustedExternalLookupStatus(str, enum.Enum):
     UNAVAILABLE = "unavailable"
 
 
+class DocumentTrustedExternalStatus(str, enum.Enum):
+    FOUND = "found"
+    NOT_FOUND = "not_found"
+    UNCHECKED = "unchecked"
+    UNAVAILABLE = "unavailable"
+
+
+class DocumentTrustedExternalCanonicalizationStatus(str, enum.Enum):
+    DIRECT_MATCH = "direct_match"
+    CANONICALIZED_BY_NAYIRI = "canonicalized_by_nayiri"
+    MORPHOLOGY_ASSISTED = "morphology_assisted"
+    UNRESOLVED = "unresolved"
+
+
 class SourceWordStatusView(str, enum.Enum):
     ALL = "all"
     LINKED = "linked"
@@ -149,6 +163,30 @@ class DocumentWordCandidateSummary(APIModel):
     has_reference_match: bool = False
     reference_match_count: int = 0
     best_reference_match: ReferenceMatchBest | None = None
+    trusted_external_status: DocumentTrustedExternalStatus = DocumentTrustedExternalStatus.UNCHECKED
+    trusted_external_provider_display_name: str | None = None
+    trusted_external_match_count: int = 0
+    trusted_external_matched_form: str | None = None
+    trusted_external_source_title: str | None = None
+    trusted_external_reference_link: str | None = None
+    trusted_external_snippet: str | None = None
+    trusted_external_canonicalization_status: DocumentTrustedExternalCanonicalizationStatus = (
+        DocumentTrustedExternalCanonicalizationStatus.UNRESOLVED
+    )
+
+
+class DocumentNayiriLookupSummary(APIModel):
+    found_count: int = 0
+    not_found_count: int = 0
+    unchecked_count: int = 0
+    unavailable_count: int = 0
+    total_forms: int = 0
+
+
+class DocumentNayiriLookupRunStartResponse(APIModel):
+    message: str
+    run_id: UUID
+    job_id: UUID
 
 
 class DocumentWordCandidateListResponse(OffsetPagination):
@@ -213,3 +251,17 @@ class WordCheckResponse(APIModel):
     trusted_external_status: TrustedExternalLookupStatus | None = None
     trusted_external_match_count: int = 0
     trusted_external_sources: list[TrustedExternalWordCheckSource] = Field(default_factory=list)
+
+
+class NayiriCorpusMatchRead(APIModel):
+    normalized_query: str
+    canonical_form: str
+    token_count: int
+    source_count: int
+
+
+class NayiriCorpusCheckResponse(APIModel):
+    query: str
+    normalized_query: str
+    found: bool = False
+    matches: list[NayiriCorpusMatchRead] = Field(default_factory=list)

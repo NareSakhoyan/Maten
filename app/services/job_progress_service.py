@@ -57,6 +57,17 @@ STAGE_REGISTRIES: dict[JobKind, dict[str, StageDefinition]] = {
         "finalizing": StageDefinition("Finalizing", "Preparing the run results for display.", 97),
         "completed": StageDefinition("Completed", "Reference matching is complete.", 100),
     },
+    JobKind.NAYIRI_TRUSTED_LOOKUP: {
+        "queued": StageDefinition("Queued", "Your Nayiri check is waiting to start.", 0),
+        "loading_words": StageDefinition("Loading words", "Collecting document words to check in Nayiri.", 5),
+        "checking_nayiri": StageDefinition(
+            "Checking Nayiri",
+            "Looking up document words in Nayiri using cached results when available.",
+            55,
+        ),
+        "finalizing": StageDefinition("Finalizing", "Preparing Nayiri lookup results for review.", 97),
+        "completed": StageDefinition("Completed", "Nayiri lookup is complete.", 100),
+    },
     JobKind.MORPHOLOGY: {
         "queued": StageDefinition("Queued", "Your morphology run is waiting to start.", 0),
         "loading_scope": StageDefinition("Loading scope", "Collecting tokens from the selected source.", 5),

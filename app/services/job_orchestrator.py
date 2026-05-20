@@ -25,6 +25,7 @@ JOB_TASKS: dict[JobKind, JobTaskSpec] = {
     JobKind.REFERENCE_IMPORT: JobTaskSpec("app.workers.tasks.process_reference_source_import"),
     JobKind.REFERENCE_MATCHING: JobTaskSpec("app.workers.tasks.process_reference_matching_run"),
     JobKind.MORPHOLOGY: JobTaskSpec("app.workers.tasks.process_morphology_run"),
+    JobKind.NAYIRI_TRUSTED_LOOKUP: JobTaskSpec("app.workers.tasks.process_document_nayiri_lookup_run"),
 }
 
 

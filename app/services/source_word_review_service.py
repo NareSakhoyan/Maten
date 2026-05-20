@@ -2,13 +2,24 @@ from __future__ import annotations
 
 from uuid import UUID
 
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from app.db.models import Document, Lexeme, LexemeForm, Occurrence, OccurrenceScriptType, ReferenceEntry, ReferenceSource
 from app.schemas.lexicon import LexiconGroupState, LexiconGroupView
 from app.schemas.reference import ReferenceStatusFilter
-from app.schemas.word import DocumentWordCandidateSummary, ReferenceSourceWordCandidateSummary, SourceWordStatusView
+from app.db.models import ReferenceMatchTargetType
+from app.schemas.word import (
+    DocumentTrustedExternalStatus,
+    DocumentWordCandidateSummary,
+    ReferenceSourceWordCandidateSummary,
+    SourceWordStatusView,
+)
+from app.services.document_trusted_external_service import (
+    DocumentTrustedExternalService,
+    NayiriLookupSnapshot,
+    get_document_trusted_external_service,
+)
 from app.services.lexicon_service import LexiconService
 from app.services.reference_matching_service import ReferenceMatchingService, get_reference_matching_service
 from app.services.word_evidence_service import WordEvidenceService, get_word_evidence_service
@@ -23,10 +34,14 @@ class SourceWordReviewService:
         lexicon_service: LexiconService | None = None,
         reference_matching_service: ReferenceMatchingService | None = None,
         word_evidence_service: WordEvidenceService | None = None,
+        document_trusted_external_service: DocumentTrustedExternalService | None = None,
     ) -> None:
         self.reference_matching_service = reference_matching_service or get_reference_matching_service()
         self.lexicon_service = lexicon_service or LexiconService(reference_matching_service=self.reference_matching_service)
         self.word_evidence_service = word_evidence_service or get_word_evidence_service()
+        self.document_trusted_external_service = (
+            document_trusted_external_service or get_document_trusted_external_service()
+        )
 
     def list_document_word_candidates(
         self,
@@ -47,10 +62,11 @@ class SourceWordReviewService:
         )
         filters = self._document_status_filters(group_subquery, status_view=status_view)
         filters.extend(
-            self.lexicon_service._reference_status_filters(  # noqa: SLF001
+            self._document_reference_status_filters(
                 session,
                 group_subquery,
                 user_id=user_id,
+                document_id=document.id,
                 reference_status=reference_status,
             )
         )
@@ -67,6 +83,10 @@ class SourceWordReviewService:
         reference_summary_map = self.reference_matching_service.group_summary_map(
             session,
             user_id=user_id,
+            normalized_forms=normalized_forms,
+        )
+        nayiri_status_map = self.document_trusted_external_service.nayiri_status_map(
+            session,
             normalized_forms=normalized_forms,
         )
 
@@ -86,6 +106,14 @@ class SourceWordReviewService:
             )
             dominant_script_type = OccurrenceScriptType(row.dominant_script_type)
             reference_summary = reference_summary_map[row.normalized_form]
+            nayiri_snapshot = nayiri_status_map.get(
+                row.normalized_form,
+                NayiriLookupSnapshot(status=DocumentTrustedExternalStatus.UNCHECKED),
+            )
+            has_reference_match = self.document_trusted_external_service.combined_has_reference_match(
+                imported_has_match=reference_summary.has_reference_match,
+                nayiri_snapshot=nayiri_snapshot,
+            )
             items.append(
                 DocumentWordCandidateSummary(
                     source_id=str(document.id),
@@ -106,12 +134,79 @@ class SourceWordReviewService:
                     dominant_script_type=dominant_script_type,
                     is_suspicious=is_suspicious_script_type(dominant_script_type),
                     suspicion_reasons=suspicion_reasons_for_script_type(dominant_script_type),
-                    has_reference_match=reference_summary.has_reference_match,
+                    has_reference_match=has_reference_match,
                     reference_match_count=reference_summary.reference_match_count,
                     best_reference_match=reference_summary.best_reference_match,
+                    trusted_external_status=nayiri_snapshot.status,
+                    trusted_external_provider_display_name=nayiri_snapshot.provider_display_name,
+                    trusted_external_match_count=nayiri_snapshot.match_count,
+                    trusted_external_matched_form=nayiri_snapshot.matched_form,
+                    trusted_external_source_title=nayiri_snapshot.source_title,
+                    trusted_external_reference_link=nayiri_snapshot.reference_link,
+                    trusted_external_snippet=nayiri_snapshot.snippet,
+                    trusted_external_canonicalization_status=nayiri_snapshot.canonicalization_status,
                 )
             )
         return items, total
+
+    def _document_reference_status_filters(
+        self,
+        session: Session,
+        group_subquery,
+        *,
+        user_id: UUID,
+        document_id: UUID,
+        reference_status: ReferenceStatusFilter,
+    ) -> list[object]:
+        if reference_status is ReferenceStatusFilter.ALL:
+            return []
+
+        imported_match_subquery = self.reference_matching_service.reference_status_filter_for_session(
+            session,
+            user_id=user_id,
+            target_type=ReferenceMatchTargetType.LEXICON_GROUP,
+        )
+        forms = self.document_trusted_external_service.list_document_normalized_forms(
+            session,
+            user_id=user_id,
+            document_id=document_id,
+        )
+        nayiri_map = self.document_trusted_external_service.nayiri_status_map(
+            session,
+            normalized_forms=forms,
+        )
+        nayiri_found_forms = [
+            form
+            for form, snapshot in nayiri_map.items()
+            if snapshot.status is DocumentTrustedExternalStatus.FOUND
+        ]
+        nayiri_unmatched_forms = [
+            form
+            for form, snapshot in nayiri_map.items()
+            if snapshot.status is DocumentTrustedExternalStatus.NOT_FOUND
+        ]
+
+        if reference_status is ReferenceStatusFilter.MATCHED:
+            matched_clauses = []
+            if imported_match_subquery is not None:
+                matched_clauses.append(group_subquery.c.normalized_form.in_(imported_match_subquery))
+            if nayiri_found_forms:
+                matched_clauses.append(group_subquery.c.normalized_form.in_(nayiri_found_forms))
+            if not matched_clauses:
+                return [group_subquery.c.normalized_form.in_(())]
+            return [or_(*matched_clauses)]
+
+        unmatched_clauses = [group_subquery.c.normalized_form.in_(nayiri_unmatched_forms)]
+        excluded_clauses = []
+        if imported_match_subquery is not None:
+            excluded_clauses.append(group_subquery.c.normalized_form.in_(imported_match_subquery))
+        if nayiri_found_forms:
+            excluded_clauses.append(group_subquery.c.normalized_form.in_(nayiri_found_forms))
+        if excluded_clauses:
+            unmatched_clauses.append(~or_(*excluded_clauses))
+        if not nayiri_unmatched_forms:
+            return [group_subquery.c.normalized_form.in_(())]
+        return unmatched_clauses
 
     def list_reference_source_word_candidates(
         self,
@@ -248,22 +343,33 @@ class SourceWordReviewService:
 
     @staticmethod
     def _document_status_filters(group_subquery, *, status_view: SourceWordStatusView) -> list[object]:
+        non_digit_mixed_filter = (
+            group_subquery.c.dominant_script_type != OccurrenceScriptType.DIGIT_MIXED.value
+        )
         if status_view is SourceWordStatusView.ALL:
-            return []
+            return [non_digit_mixed_filter]
         if status_view is SourceWordStatusView.LINKED:
-            return [group_subquery.c.group_state == LexiconGroupState.LINKED.value]
+            return [
+                group_subquery.c.group_state == LexiconGroupState.LINKED.value,
+                non_digit_mixed_filter,
+            ]
         if status_view is SourceWordStatusView.UNLINKED:
             return [
                 group_subquery.c.group_state == LexiconGroupState.UNREVIEWED.value,
                 group_subquery.c.dominant_script_type == OccurrenceScriptType.ARMENIAN.value,
+                non_digit_mixed_filter,
             ]
         if status_view is SourceWordStatusView.SUSPICIOUS:
             return [
                 group_subquery.c.dominant_script_type != OccurrenceScriptType.ARMENIAN.value,
                 group_subquery.c.group_state != LexiconGroupState.IGNORED_NOISE.value,
+                non_digit_mixed_filter,
             ]
         if status_view is SourceWordStatusView.IGNORED:
-            return [group_subquery.c.group_state == LexiconGroupState.IGNORED_NOISE.value]
+            return [
+                group_subquery.c.group_state == LexiconGroupState.IGNORED_NOISE.value,
+                non_digit_mixed_filter,
+            ]
         return []
 
     @staticmethod
