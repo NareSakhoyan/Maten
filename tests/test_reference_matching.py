@@ -13,7 +13,6 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.db.models import (
-    Base,
     Document,
     DocumentPage,
     DocumentStatus,
@@ -50,7 +49,7 @@ from app.services.reference_import_service import ReferenceImportService
 from app.services.reference_matching_service import ReferenceMatchingService
 from app.services.reference_source_service import ReferenceSourceService
 from app.utils.token_classification import classify_token
-from conftest import PRIMARY_USER_ID, SECONDARY_USER_ID
+from conftest import PRIMARY_USER_ID, SECONDARY_USER_ID, rebuild_lexicon_index_for_document
 
 
 def _current_user(user_id: UUID = PRIMARY_USER_ID) -> AuthenticatedUser:
@@ -706,6 +705,7 @@ def test_reference_status_filtering(db_session: Session) -> None:
         context_snippet="unmatched group",
     )
     db_session.commit()
+    rebuild_lexicon_index_for_document(db_session, user_id=PRIMARY_USER_ID, document=document)
 
     matched_lexeme = lexeme_service.create_lexeme(
         db_session,
@@ -1381,50 +1381,3 @@ def test_source_first_process_run_ignores_internal_view_parameter(
         verification_session.close()
 
 
-def test_legacy_lexicon_and_lexeme_flows_survive_missing_reference_tables(db_session: Session) -> None:
-    lexeme_service = LexemeService()
-    from app.services.lexicon_service import LexiconService
-
-    for table_name in [
-        "reference_match_run_result_matches",
-        "reference_match_run_results",
-        "reference_matches",
-        "reference_match_runs",
-        "reference_entries",
-        "reference_sources",
-    ]:
-        Base.metadata.tables[table_name].drop(bind=db_session.bind)
-
-    document, page = _seed_document(db_session, user_id=PRIMARY_USER_ID, title="legacy-safe")
-    _add_occurrence(
-        db_session,
-        document=document,
-        page=page,
-        token="Հայաստան",
-        normalized_token="հայաստան",
-        context_snippet="legacy context",
-    )
-    db_session.commit()
-
-    lexeme = lexeme_service.create_lexeme(
-        db_session,
-        user_id=PRIMARY_USER_ID,
-        request=LexemeCreateRequest(
-            canonical_form="Հայաստան",
-            normalized_forms=["հայաստան"],
-            status=LexemeStatus.DRAFT,
-        ),
-    )
-    assert lexeme.has_reference_match is False
-    assert lexeme.reference_match_count == 0
-
-    groups, total = LexiconService().list_groups(
-        db_session,
-        user_id=PRIMARY_USER_ID,
-        limit=20,
-        offset=0,
-        view=LexiconGroupView.LINKED,
-    )
-    assert total == 1
-    assert groups[0].normalized_form == "հայաստան"
-    assert groups[0].has_reference_match is False

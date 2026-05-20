@@ -14,7 +14,7 @@ from app.services.lexicon_service import LexiconService
 from app.services.occurrence_service import OccurrenceService
 from app.utils.token_classification import classify_token
 from app.utils.text_reconstruction import reconstruct_page_text
-from conftest import PRIMARY_USER_ID, SECONDARY_USER_ID
+from conftest import PRIMARY_USER_ID, SECONDARY_USER_ID, rebuild_lexicon_index_for_document
 
 
 def _seed_document(
@@ -85,6 +85,10 @@ def _add_occurrence(
     return occurrence
 
 
+def _sync_document_index(session: Session, document: Document) -> None:
+    rebuild_lexicon_index_for_document(session, user_id=PRIMARY_USER_ID, document=document)
+
+
 def test_default_candidates_view_filters_to_reviewer_relevant_armenian_groups(db_session: Session) -> None:
     lexicon_service = LexiconService()
     review_service = LexiconReviewService()
@@ -124,6 +128,7 @@ def test_default_candidates_view_filters_to_reviewer_relevant_armenian_groups(db
         context_snippet="Linked Armenian group",
     )
     db_session.commit()
+    _sync_document_index(db_session, document)
 
     review_service.ignore_groups(
         db_session,
@@ -195,6 +200,7 @@ def test_suspicious_view_returns_non_armenian_non_ignored_groups(db_session: Ses
         context_snippet="ignored suspicious token",
     )
     db_session.commit()
+    _sync_document_index(db_session, document)
 
     review_service.ignore_groups(db_session, user_id=PRIMARY_USER_ID, normalized_forms=["skip"])
 
@@ -228,6 +234,7 @@ def test_ignore_and_unignore_groups_support_bulk_forms(db_session: Session) -> N
             context_snippet=f"{token} համատեքստ",
         )
     db_session.commit()
+    _sync_document_index(db_session, document)
 
     ignored = review_service.ignore_groups(
         db_session,
@@ -290,6 +297,7 @@ def test_linked_state_takes_precedence_over_ignored_review(db_session: Session) 
         context_snippet="linked and ignored token",
     )
     db_session.commit()
+    _sync_document_index(db_session, document)
 
     review_service.ignore_groups(db_session, user_id=PRIMARY_USER_ID, normalized_forms=["գիրք"])
     detail = lexeme_service.create_lexeme(
@@ -337,6 +345,7 @@ def test_group_detail_includes_document_title_page_and_snippet(db_session: Sessi
         page_number=7,
     )
     db_session.commit()
+    _sync_document_index(db_session, document)
 
     detail = lexicon_service.get_group_detail(db_session, user_id=PRIMARY_USER_ID, normalized_form="հայաստան")
 
@@ -361,6 +370,7 @@ def test_create_lexeme_from_suspicious_group_still_works(db_session: Session) ->
         context_snippet="Suspicious Latin context",
     )
     db_session.commit()
+    _sync_document_index(db_session, document)
 
     detail = lexeme_service.create_lexeme(
         db_session,
@@ -483,6 +493,8 @@ def test_user_isolation_across_review_states(db_session: Session) -> None:
         context_snippet="Երկրորդ օգտվողի բառ",
     )
     db_session.commit()
+    _sync_document_index(db_session, primary_document)
+    rebuild_lexicon_index_for_document(db_session, user_id=SECONDARY_USER_ID, document=secondary_document)
 
     review_service.ignore_groups(db_session, user_id=PRIMARY_USER_ID, normalized_forms=["բառ"])
 

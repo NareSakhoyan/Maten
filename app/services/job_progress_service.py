@@ -8,6 +8,8 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.db.models import JobKind, JobStageEvent
+from app.schemas.common import JobStageEventRead
+from app.services.job_progress_notifier import publish_job_progress
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,6 +56,19 @@ STAGE_REGISTRIES: dict[JobKind, dict[str, StageDefinition]] = {
         "saving_results": StageDefinition("Saving results", "Saving source-entry results for review.", 90),
         "finalizing": StageDefinition("Finalizing", "Preparing the run results for display.", 97),
         "completed": StageDefinition("Completed", "Reference matching is complete.", 100),
+    },
+    JobKind.MORPHOLOGY: {
+        "queued": StageDefinition("Queued", "Your morphology run is waiting to start.", 0),
+        "loading_scope": StageDefinition("Loading scope", "Collecting tokens from the selected source.", 5),
+        "checking_eligibility": StageDefinition(
+            "Checking eligibility",
+            "Checking whether the selected source can use the Classical Armenian PIE model.",
+            15,
+        ),
+        "running_pie": StageDefinition("Running PIE", "Analyzing eligible tokens with the PIE model.", 55),
+        "saving_results": StageDefinition("Saving results", "Saving morphology results for review.", 90),
+        "finalizing": StageDefinition("Finalizing", "Preparing the morphology results for use.", 97),
+        "completed": StageDefinition("Completed", "Morphology analysis is complete.", 100),
     },
 }
 
@@ -164,6 +179,7 @@ class JobProgressService:
         )
         if hasattr(job, "finished_at"):
             setattr(job, "finished_at", datetime.now(timezone.utc))
+        publish_job_progress(str(getattr(job, "id")), {"type": "job_refresh"}, user_id=str(getattr(job, "user_id")))
 
     def fail(
         self,
@@ -187,6 +203,7 @@ class JobProgressService:
             items_total=getattr(job, "items_total", None),
             force=True,
         )
+        publish_job_progress(str(getattr(job, "id")), {"type": "job_refresh"}, user_id=str(getattr(job, "user_id")))
 
     def append_event(
         self,
@@ -224,21 +241,28 @@ class JobProgressService:
             ):
                 return
 
-        session.add(
-            JobStageEvent(
-                job_kind=job_kind,
-                job_id=job_id,
-                user_id=user_id,
-                stage_code=stage_code,
-                stage_label=stage_label,
-                message_user=message_user,
-                progress_percent=progress_percent,
-                items_processed=items_processed,
-                items_total=items_total,
-                created_at=datetime.now(timezone.utc),
-            )
+        event = JobStageEvent(
+            job_kind=job_kind,
+            job_id=job_id,
+            user_id=user_id,
+            stage_code=stage_code,
+            stage_label=stage_label,
+            message_user=message_user,
+            progress_percent=progress_percent,
+            items_processed=items_processed,
+            items_total=items_total,
+            created_at=datetime.now(timezone.utc),
         )
+        session.add(event)
         session.flush()
+        publish_job_progress(
+            job_id,
+            {
+                "type": "event",
+                "event": JobStageEventRead.model_validate(event).model_dump(mode="json"),
+            },
+            user_id=user_id,
+        )
 
     def list_events(
         self,

@@ -19,6 +19,8 @@ class DocumentRead(APIModel):
     storage_path: str
     sha256: str
     page_count: int | None
+    language_stage: str | None = None
+    morphology_profile: str | None = None
     status: DocumentStatus
     latest_job_id: UUID | None = None
     latest_job_status: str | None = None
@@ -34,6 +36,24 @@ class DocumentStartResponse(APIModel):
     message: str
     document: DocumentRead
     job: LongRunningJobRead
+
+
+class DocumentOptionRead(APIModel):
+    id: UUID
+    title: str
+    original_filename: str
+
+
+class DocumentOptionListResponse(OffsetPagination):
+    items: list[DocumentOptionRead]
+
+
+class DocumentStatusStatsRead(APIModel):
+    total: int
+    completed: int
+    processing: int
+    queued: int
+    failed: int
 
 
 class DocumentListResponse(OffsetPagination):

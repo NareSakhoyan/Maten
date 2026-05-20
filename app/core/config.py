@@ -1,14 +1,38 @@
 from __future__ import annotations
 
 from functools import lru_cache
+import os
+from pathlib import Path
 
+from dotenv import dotenv_values
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
+BACKEND_ROOT = Path(__file__).resolve().parents[2]
+CONFIG_DIR = BACKEND_ROOT / "config"
+LOCAL_ENV_FILE = BACKEND_ROOT / ".env"
+
+
+def _selected_app_env() -> str:
+    app_env = os.getenv("APP_ENV")
+    if not app_env and LOCAL_ENV_FILE.exists():
+        app_env = dotenv_values(LOCAL_ENV_FILE).get("APP_ENV")
+    return (app_env or "development").strip().lower()
+
+
+def settings_env_files() -> tuple[str, ...]:
+    app_env = _selected_app_env()
+    candidates = (
+        CONFIG_DIR / "base.env",
+        CONFIG_DIR / f"{app_env}.env",
+        LOCAL_ENV_FILE,
+    )
+    return tuple(str(path) for path in candidates if path.exists())
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
-        env_file=".env",
         env_file_encoding="utf-8",
         case_sensitive=False,
         extra="ignore",
@@ -90,6 +114,13 @@ class Settings(BaseSettings):
         alias="NAYIRI_PROVIDER_RATE_LIMIT_MS",
         ge=0,
     )
+    pie_enabled: bool = Field(default=True, alias="PIE_ENABLED")
+    pie_executable: str = Field(default="pie", alias="PIE_EXECUTABLE")
+    pie_model_root: str | None = Field(default=None, alias="PIE_MODEL_ROOT")
+    pie_model_key: str = Field(default="xcl", alias="PIE_MODEL_KEY")
+    pie_batch_size: int = Field(default=8, alias="PIE_BATCH_SIZE", ge=1)
+    pie_max_tokens_per_batch: int = Field(default=256, alias="PIE_MAX_TOKENS_PER_BATCH", ge=1)
+    pie_run_only_for_classical: bool = Field(default=True, alias="PIE_RUN_ONLY_FOR_CLASSICAL")
 
     @field_validator("database_url", mode="before")
     @classmethod
@@ -118,6 +149,22 @@ class Settings(BaseSettings):
             return value
         return value.strip().strip('"').strip("'").rstrip("/")
 
+    @field_validator("pie_model_root", mode="before")
+    @classmethod
+    def normalize_pie_model_root(cls, value: str | None) -> str | None:
+        if not isinstance(value, str):
+            return value
+        normalized = value.strip().strip('"').strip("'")
+        return normalized or None
+
+    @field_validator("pie_executable", mode="before")
+    @classmethod
+    def normalize_pie_executable(cls, value: str) -> str:
+        if not isinstance(value, str):
+            return value
+        normalized = value.strip().strip('"').strip("'")
+        return normalized or "pie"
+
     @property
     def max_upload_bytes(self) -> int:
         return self.max_upload_mb * 1024 * 1024
@@ -133,4 +180,4 @@ class Settings(BaseSettings):
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
-    return Settings()
+    return Settings(_env_file=settings_env_files())

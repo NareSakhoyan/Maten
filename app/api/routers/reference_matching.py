@@ -6,7 +6,8 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_user, get_db_session
-from app.core.celery_app import celery_app
+from app.db.models import JobKind
+from app.services.job_orchestrator import get_job_orchestrator
 from app.db.models import JobKind
 from app.schemas.common import JobStageEventListResponse, JobStageEventRead
 from app.schemas.job import LongRunningJobRead
@@ -57,14 +58,13 @@ async def create_reference_matching_run(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
 
     try:
-        celery_app.send_task(
-            "app.workers.tasks.process_reference_matching_run",
-            args=[str(run.id)],
+        get_job_orchestrator().enqueue(
+            JobKind.REFERENCE_MATCHING,
+            run.id,
             kwargs={
                 "view": request.view,
                 "include_fuzzy": request.include_fuzzy,
             },
-            task_id=str(run.id),
         )
     except Exception as exc:
         reference_matching_service.mark_run_failed(
@@ -107,14 +107,13 @@ async def retry_reference_matching_run(
         raise HTTPException(status_code=exc.status_code, detail=exc.message) from exc
 
     try:
-        celery_app.send_task(
-            "app.workers.tasks.process_reference_matching_run",
-            args=[str(retry_run.id)],
+        get_job_orchestrator().enqueue(
+            JobKind.REFERENCE_MATCHING,
+            retry_run.id,
             kwargs={
                 "view": retry_run.requested_view,
                 "include_fuzzy": retry_run.include_fuzzy,
             },
-            task_id=str(retry_run.id),
         )
     except Exception as exc:
         reference_matching_service.mark_run_failed(

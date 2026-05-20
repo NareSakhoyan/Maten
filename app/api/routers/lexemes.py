@@ -12,6 +12,8 @@ from app.schemas.lexeme import (
     LexemeDetail,
     LexemeListResponse,
     LexemeMergeGroupsRequest,
+    LexemePickerItem,
+    LexemePickerListResponse,
     LexemeUpdateRequest,
 )
 from app.schemas.reference import ReferenceStatusFilter, ReferenceTargetMatchesResponse
@@ -50,6 +52,7 @@ async def create_lexeme(
 async def list_lexemes(
     search: str | None = Query(default=None),
     reference_status: ReferenceStatusFilter = Query(default=ReferenceStatusFilter.ALL),
+    include_reference_summary: bool = Query(default=False),
     limit: int = Query(default=20, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
     current_user: AuthenticatedUser = Depends(get_current_user),
@@ -63,8 +66,41 @@ async def list_lexemes(
         offset=offset,
         search=search,
         reference_status=reference_status,
+        include_reference_summary=include_reference_summary,
     )
     return LexemeListResponse(items=items, total=total, limit=limit, offset=offset)
+
+
+@router.get("/picker", response_model=LexemePickerListResponse)
+async def list_lexeme_picker(
+    search: str | None = Query(default=None),
+    limit: int = Query(default=20, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+    current_user: AuthenticatedUser = Depends(get_current_user),
+    session: Session = Depends(get_db_session),
+    lexeme_service: LexemeService = Depends(get_lexeme_service),
+) -> LexemePickerListResponse:
+    items, total = lexeme_service.list_lexeme_picker(
+        session,
+        user_id=current_user.user_id,
+        limit=limit,
+        offset=offset,
+        search=search,
+    )
+    return LexemePickerListResponse(
+        items=[
+            LexemePickerItem(
+                id=item.id,
+                canonical_form=item.canonical_form,
+                canonical_normalized_form=item.canonical_normalized_form,
+                status=item.status,
+            )
+            for item in items
+        ],
+        total=total,
+        limit=limit,
+        offset=offset,
+    )
 
 
 @router.get("/{lexeme_id}", response_model=LexemeDetail)

@@ -7,11 +7,13 @@ from fastapi.exception_handlers import http_exception_handler, request_validatio
 from fastapi.exceptions import RequestValidationError
 from fastapi.requests import Request
 from fastapi.responses import JSONResponse
+from sqlalchemy import text
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api.routers import documents, health, jobs, lexemes, lexicon, occurrences, reference_matching, reference_sources, words
+from app.api.routers import documents, health, jobs, lexemes, lexicon, me, morphology, occurrences, reference_matching, reference_sources, words
 from app.core.config import get_settings
+from app.core.database import engine
 from app.core.logging import configure_logging
 
 
@@ -45,6 +47,14 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
     )
 
+    @app.on_event("startup")
+    def warm_database_pool() -> None:
+        try:
+            with engine.connect() as connection:
+                connection.execute(text("SELECT 1"))
+        except Exception:
+            logger.warning("Database pool warmup failed; first request will retry connection.", exc_info=True)
+
     @app.exception_handler(StarletteHTTPException)
     async def log_http_exception(request: Request, exc: StarletteHTTPException):
         _log_frontend_error(request, status_code=exc.status_code, detail=exc.detail)
@@ -66,6 +76,7 @@ def create_app() -> FastAPI:
 
     api_v1 = APIRouter(prefix="/api/v1")
     api_v1.include_router(health.router, tags=["health"])
+    api_v1.include_router(me.router, tags=["me"])
     api_v1.include_router(documents.router, tags=["documents"])
     api_v1.include_router(occurrences.router, tags=["occurrences"])
     api_v1.include_router(jobs.router, tags=["jobs"])
@@ -73,6 +84,7 @@ def create_app() -> FastAPI:
     api_v1.include_router(lexemes.router, tags=["lexemes"])
     api_v1.include_router(reference_sources.router, tags=["reference-sources"])
     api_v1.include_router(reference_matching.router, tags=["reference-matching"])
+    api_v1.include_router(morphology.router, tags=["morphology"])
     api_v1.include_router(words.router, tags=["words"])
     app.include_router(api_v1)
     return app

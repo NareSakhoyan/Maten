@@ -85,6 +85,20 @@ class LexemeService:
             ]
         )
         self._assign_occurrences(session, user_id=user_id, normalized_forms=normalized_forms, lexeme_id=lexeme.id)
+        from app.services.document_workflow_service import get_document_workflow_service
+
+        get_document_workflow_service().sync_for_normalized_forms(
+            session,
+            user_id=user_id,
+            normalized_forms=normalized_forms,
+        )
+        from app.services.lexicon_group_index_service import get_lexicon_group_index_service
+
+        get_lexicon_group_index_service().sync_metadata(
+            session,
+            user_id=user_id,
+            normalized_forms=normalized_forms,
+        )
         session.commit()
         return self.get_lexeme_detail(session, user_id=user_id, lexeme_id=lexeme.id)
 
@@ -97,6 +111,7 @@ class LexemeService:
         offset: int,
         search: str | None = None,
         reference_status: ReferenceStatusFilter = ReferenceStatusFilter.ALL,
+        include_reference_summary: bool = False,
     ) -> tuple[list[LexemeSummary], int]:
         user_key = str(user_id)
         filters = [Lexeme.user_id == user_key]
@@ -117,59 +132,115 @@ class LexemeService:
 
         total = session.scalar(select(func.count(Lexeme.id)).where(*filters)) or 0
 
-        form_counts = (
-            select(
-                LexemeForm.lexeme_id.label("lexeme_id"),
-                func.count(LexemeForm.id).label("form_count"),
+        lexemes = list(
+            session.scalars(
+                select(Lexeme)
+                .where(*filters)
+                .order_by(Lexeme.created_at.desc(), Lexeme.id.desc())
+                .limit(limit)
+                .offset(offset)
             )
-            .group_by(LexemeForm.lexeme_id)
-            .subquery()
         )
-        occurrence_counts = (
-            select(
-                Occurrence.lexeme_id.label("lexeme_id"),
-                func.count(Occurrence.id).label("occurrence_count"),
-            )
-            .where(Occurrence.lexeme_id.is_not(None))
-            .group_by(Occurrence.lexeme_id)
-            .subquery()
-        )
+        if not lexemes:
+            return [], total
 
-        rows = session.execute(
-            select(
-                Lexeme,
-                func.coalesce(form_counts.c.form_count, 0).label("form_count"),
-                func.coalesce(occurrence_counts.c.occurrence_count, 0).label("occurrence_count"),
+        lexeme_ids = [lexeme.id for lexeme in lexemes]
+        form_count_map = {
+            lexeme_id: count
+            for lexeme_id, count in session.execute(
+                select(LexemeForm.lexeme_id, func.count(LexemeForm.id))
+                .where(
+                    LexemeForm.user_id == user_key,
+                    LexemeForm.lexeme_id.in_(lexeme_ids),
+                )
+                .group_by(LexemeForm.lexeme_id)
             )
-            .outerjoin(form_counts, form_counts.c.lexeme_id == Lexeme.id)
-            .outerjoin(occurrence_counts, occurrence_counts.c.lexeme_id == Lexeme.id)
-            .where(*filters)
-            .order_by(Lexeme.created_at.desc(), Lexeme.id.desc())
-            .limit(limit)
-            .offset(offset)
-        ).all()
+        }
+        occurrence_count_map = {
+            lexeme_id: count
+            for lexeme_id, count in session.execute(
+                select(Occurrence.lexeme_id, func.count(Occurrence.id))
+                .where(Occurrence.lexeme_id.in_(lexeme_ids))
+                .group_by(Occurrence.lexeme_id)
+            )
+        }
 
-        reference_summary_map = self.reference_matching_service.lexeme_summary_map(
-            session,
-            user_id=user_id,
-            lexeme_ids=[row.Lexeme.id for row in rows],
+        reference_summary_map = (
+            self.reference_matching_service.lexeme_summary_map(
+                session,
+                user_id=user_id,
+                lexeme_ids=lexeme_ids,
+            )
+            if include_reference_summary
+            else {}
         )
         items = [
             LexemeSummary(
-                id=row.Lexeme.id,
-                canonical_form=row.Lexeme.canonical_form,
-                canonical_normalized_form=row.Lexeme.canonical_normalized_form,
-                status=row.Lexeme.status,
-                notes=row.Lexeme.notes,
-                form_count=row.form_count,
-                occurrence_count=row.occurrence_count,
-                created_at=row.Lexeme.created_at,
-                updated_at=row.Lexeme.updated_at,
-                has_reference_match=reference_summary_map[str(row.Lexeme.id)].has_reference_match,
-                reference_match_count=reference_summary_map[str(row.Lexeme.id)].reference_match_count,
-                best_reference_match=reference_summary_map[str(row.Lexeme.id)].best_reference_match,
+                id=lexeme.id,
+                canonical_form=lexeme.canonical_form,
+                canonical_normalized_form=lexeme.canonical_normalized_form,
+                status=lexeme.status,
+                notes=lexeme.notes,
+                form_count=form_count_map.get(lexeme.id, 0),
+                occurrence_count=occurrence_count_map.get(lexeme.id, 0),
+                created_at=lexeme.created_at,
+                updated_at=lexeme.updated_at,
+                has_reference_match=reference_summary_map[str(lexeme.id)].has_reference_match
+                if include_reference_summary
+                else False,
+                reference_match_count=reference_summary_map[str(lexeme.id)].reference_match_count
+                if include_reference_summary
+                else 0,
+                best_reference_match=reference_summary_map[str(lexeme.id)].best_reference_match
+                if include_reference_summary
+                else None,
             )
-            for row in rows
+            for lexeme in lexemes
+        ]
+        return items, total
+
+    def list_lexeme_picker(
+        self,
+        session: Session,
+        *,
+        user_id: UUID,
+        limit: int,
+        offset: int,
+        search: str | None = None,
+    ) -> tuple[list[LexemeSummary], int]:
+        user_key = str(user_id)
+        filters = [Lexeme.user_id == user_key]
+        if search:
+            normalized_search = normalize_token(search)
+            if normalized_search:
+                filters.append(
+                    (Lexeme.canonical_normalized_form.ilike(f"%{normalized_search}%"))
+                    | (Lexeme.canonical_form.ilike(f"%{search.strip()}%"))
+                )
+
+        total = session.scalar(select(func.count(Lexeme.id)).where(*filters)) or 0
+        lexemes = list(
+            session.scalars(
+                select(Lexeme)
+                .where(*filters)
+                .order_by(Lexeme.canonical_form.asc(), Lexeme.id.asc())
+                .limit(limit)
+                .offset(offset)
+            )
+        )
+        items = [
+            LexemeSummary(
+                id=lexeme.id,
+                canonical_form=lexeme.canonical_form,
+                canonical_normalized_form=lexeme.canonical_normalized_form,
+                status=lexeme.status,
+                notes=lexeme.notes,
+                form_count=0,
+                occurrence_count=0,
+                created_at=lexeme.created_at,
+                updated_at=lexeme.updated_at,
+            )
+            for lexeme in lexemes
         ]
         return items, total
 
@@ -299,6 +370,20 @@ class LexemeService:
             )
 
         self._assign_occurrences(session, user_id=user_id, normalized_forms=normalized_forms, lexeme_id=lexeme_id)
+        from app.services.document_workflow_service import get_document_workflow_service
+
+        get_document_workflow_service().sync_for_normalized_forms(
+            session,
+            user_id=user_id,
+            normalized_forms=normalized_forms,
+        )
+        from app.services.lexicon_group_index_service import get_lexicon_group_index_service
+
+        get_lexicon_group_index_service().sync_metadata(
+            session,
+            user_id=user_id,
+            normalized_forms=normalized_forms,
+        )
         session.commit()
         return self.get_lexeme_detail(session, user_id=user_id, lexeme_id=lexeme_id)
 

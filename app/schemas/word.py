@@ -106,6 +106,10 @@ class WordEvidenceSummary(APIModel):
     source_count: int
     linked_lexeme_id: UUID | None = None
     linked_lexeme_canonical_form: str | None = None
+    best_lemma: str | None = None
+    lemma_candidates: list[str] = Field(default_factory=list)
+    pos_candidates: list[str] = Field(default_factory=list)
+    morphology_available: bool = False
 
 
 class WordEvidenceExternalSummary(APIModel):

@@ -34,6 +34,14 @@ def main() -> None:
         mime_type = detect_mime_type(document.original_filename, original_bytes, document.mime_type)
         page_count, page_iterator = page_extraction_service.iter_document_pages(original_bytes, mime_type)
 
+        from app.services.lexicon_group_index_service import get_lexicon_group_index_service
+
+        index_service = get_lexicon_group_index_service()
+        index_service.clear_document_index(
+            session,
+            user_id=document.user_id,
+            document_id=document.id,
+        )
         session.execute(delete(Occurrence).where(Occurrence.document_id == document.id))
         session.execute(delete(DocumentPage).where(DocumentPage.document_id == document.id))
         session.flush()
@@ -54,12 +62,20 @@ def main() -> None:
             session.add(page)
             session.flush()
 
-            occurrence_service.store_page_occurrences(
+            occurrences = occurrence_service.store_page_occurrences(
                 session,
                 document_id=document.id,
                 page_id=page.id,
                 page_number=page.page_number,
                 text=reconstructed_text,
+            )
+            index_service.apply_page_occurrences(
+                session,
+                user_id=document.user_id,
+                document_id=document.id,
+                document_title=document.title,
+                page_id=page.id,
+                occurrences=occurrences,
             )
 
         document.page_count = page_count
@@ -78,6 +94,8 @@ def main() -> None:
                 )
                 .values(lexeme_id=lexeme_id)
             )
+
+        session.commit()
 
     print(f"Reprocessed document {document_id}.")
 

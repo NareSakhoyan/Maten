@@ -6,6 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_user, get_db_session
+from app.schemas.morphology import MorphologyWordResponse
 from app.schemas.word import (
     WordCheckResponse,
     WordEvidenceResponse,
@@ -15,6 +16,7 @@ from app.schemas.word import (
     WordSearchResponse,
 )
 from app.services.auth_service import AuthenticatedUser
+from app.services.morphology.morphology_service import MorphologyService, get_morphology_service
 from app.services.word_evidence_service import WordEvidenceService, get_word_evidence_service
 from app.services.word_search_service import WordSearchService, get_word_search_service
 
@@ -79,6 +81,23 @@ async def get_word_evidence(
             provider_keys=provider_keys,
             limit=limit,
             offset=offset,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+
+
+@router.get("/words/{normalized_form}/morphology", response_model=MorphologyWordResponse)
+async def get_word_morphology(
+    normalized_form: str,
+    current_user: AuthenticatedUser = Depends(get_current_user),
+    session: Session = Depends(get_db_session),
+    morphology_service: MorphologyService = Depends(get_morphology_service),
+) -> MorphologyWordResponse:
+    try:
+        return morphology_service.get_word_morphology(
+            session,
+            user_id=current_user.user_id,
+            normalized_form=normalized_form,
         )
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc

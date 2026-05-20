@@ -36,6 +36,8 @@ class ReferenceSourceCreateRequest(APIModel):
     description: str | None = None
     source_type: ReferenceSourceType = ReferenceSourceType.IMPORTED_WORDLIST
     language: str | None = None
+    language_stage: str | None = None
+    morphology_profile: str | None = None
 
 
 class ReferenceSourceSummary(APIModel):
@@ -45,6 +47,8 @@ class ReferenceSourceSummary(APIModel):
     description: str | None
     source_type: ReferenceSourceType
     language: str | None
+    language_stage: str | None = None
+    morphology_profile: str | None = None
     is_active: bool
     entry_count: int
     last_import_method: SupportedReferenceImportMethod | None = None

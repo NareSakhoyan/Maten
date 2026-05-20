@@ -4,8 +4,8 @@ from uuid import UUID
 
 from sqlalchemy.orm import Session
 
-from app.core.celery_app import celery_app
 from app.db.models import JobKind, ReferenceImportStatus, ReferenceSourceImport
+from app.services.job_orchestrator import get_job_orchestrator
 from app.schemas.job import RetryJobStartResponse
 from app.services.document_service import DocumentService, get_document_service
 from app.services.ingestion_error_service import get_ingestion_error_service
@@ -31,6 +31,7 @@ class JobRetryService:
         self.reference_import_service = reference_import_service or get_reference_import_service()
         self.reference_matching_service = reference_matching_service or get_reference_matching_service()
         self.document_service = document_service or get_document_service()
+        self.job_orchestrator = get_job_orchestrator()
 
     def retry_job(self, session: Session, *, user_id: UUID, job_id: UUID) -> RetryJobStartResponse:
         job = self.long_running_job_service.get_user_job(session, user_id=user_id, job_id=job_id)
@@ -52,11 +53,7 @@ class JobRetryService:
             failed_job_id=job_id,
         )
         try:
-            celery_app.send_task(
-                "app.workers.tasks.process_document_ingestion",
-                args=[str(retry_job.id)],
-                task_id=str(retry_job.id),
-            )
+            self.job_orchestrator.enqueue(JobKind.INGESTION, retry_job.id)
             self.document_service.mark_document_queued(session, document_id=retry_job.document_id)
         except Exception as exc:
             failure_info = get_ingestion_error_service().map_exception(exc)
@@ -92,11 +89,7 @@ class JobRetryService:
             failed_import_id=job_id,
         )
         try:
-            celery_app.send_task(
-                "app.workers.tasks.process_reference_source_import",
-                args=[str(retry_import.id)],
-                task_id=str(retry_import.id),
-            )
+            self.job_orchestrator.enqueue(JobKind.REFERENCE_IMPORT, retry_import.id)
         except Exception as exc:
             retry_import.status = ReferenceImportStatus.FAILED
             retry_import.error_code = "reference_import_enqueue_failed"
@@ -125,14 +118,13 @@ class JobRetryService:
             failed_run_id=job_id,
         )
         try:
-            celery_app.send_task(
-                "app.workers.tasks.process_reference_matching_run",
-                args=[str(retry_run.id)],
+            self.job_orchestrator.enqueue(
+                JobKind.REFERENCE_MATCHING,
+                retry_run.id,
                 kwargs={
                     "view": retry_run.requested_view,
                     "include_fuzzy": retry_run.include_fuzzy,
                 },
-                task_id=str(retry_run.id),
             )
         except Exception as exc:
             self.reference_matching_service.mark_run_failed(

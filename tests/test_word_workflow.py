@@ -356,7 +356,7 @@ def test_word_evidence_endpoint_returns_cross_source_evidence(db_session) -> Non
     assert reference_item.source_import_method is not None
 
 
-def test_source_first_reference_status_overrides_legacy_match_fallback(db_session) -> None:
+def test_source_first_reference_status_overrides_direct_internal_match(db_session) -> None:
     source_service = ReferenceSourceService()
     import_service = ReferenceImportService()
     matching_service = ReferenceMatchingService()
@@ -376,16 +376,16 @@ def test_source_first_reference_status_overrides_legacy_match_fallback(db_sessio
         content="հայաստան\n".encode("utf-8"),
     )
 
-    document, page_one, _ = _seed_document(db_session, user_id=PRIMARY_USER_ID, title="Legacy Match Book")
+    document, page_one, _ = _seed_document(db_session, user_id=PRIMARY_USER_ID, title="Direct Match Book")
     _add_occurrence(
         db_session,
         document=document,
         page=page_one,
         token="Հայաստան",
         normalized_token="հայաստան",
-        snippet="Legacy matched evidence",
+        snippet="Direct matched evidence",
     )
-    legacy_run = matching_service.create_run(
+    direct_run = matching_service.create_run(
         db_session,
         user_id=PRIMARY_USER_ID,
         request=ReferenceMatchRunCreateRequest(
@@ -393,7 +393,7 @@ def test_source_first_reference_status_overrides_legacy_match_fallback(db_sessio
             run_scope="all",
         ),
     )
-    matching_service.process_run_in_session(db_session, run_id=legacy_run.id)
+    matching_service.process_run_in_session(db_session, run_id=direct_run.id)
 
     db_session.execute(delete(Occurrence).where(Occurrence.document_id == document.id))
     source_first_run = matching_service.create_run(

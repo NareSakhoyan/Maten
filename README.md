@@ -1,6 +1,6 @@
 # Armenian Historical Books OCR Backend
 
-MVP-4 backend for authenticated uploads, page-by-page text extraction, OCR fallback with `pytesseract`, Armenian line-break reconstruction before tokenization, raw word-occurrence indexing, reviewer-centric lexicon discovery, curated lexeme management, personal reference-source matching, source-first reference-entry review, backend-only trusted external word lookup through a Nayiri web provider abstraction, and backend-defined long-running job progress tracking against Supabase Postgres and Storage.
+MVP-4 backend for authenticated uploads, page-by-page text extraction, OCR fallback with `pytesseract`, Armenian line-break reconstruction before tokenization, raw word-occurrence indexing, reviewer-centric lexicon discovery, curated lexeme management, personal reference-source matching, source-first reference-entry review, backend-only trusted external word lookup through a Nayiri web provider abstraction, backend-defined long-running job progress tracking against Supabase Postgres and Storage, and an asynchronous PIE-based morphology layer for eligible Classical Armenian sources.
 
 ## Stack
 
@@ -19,6 +19,7 @@ MVP-4 backend for authenticated uploads, page-by-page text extraction, OCR fallb
 2. Redis
 3. Tesseract OCR installed locally
 4. The Armenian model file `hye-calfa-n.traineddata`
+5. The PIE CLI plus unpacked Classical Armenian model artifacts if you want morphology analysis
 
 Example Ubuntu packages:
 
@@ -45,13 +46,19 @@ source .venv/bin/activate
 pip install -e ".[dev]"
 ```
 
-3. Create your environment file:
+3. Create your local secret/environment file:
 
 ```bash
 cp .env.example .env
 ```
 
 4. Fill in `.env` with your Supabase URL, service role key, and database URL.
+   General defaults live in tracked config files:
+   - `config/base.env`
+   - `config/development.env`
+   - `config/production.env`
+
+   `.env` should stay focused on secrets and deploy-specific endpoints.
    For local development, prefer the Supabase Session pooler connection string if your network does not support IPv6.
    You can get it from Supabase Dashboard -> Connect.
    A typical local-safe example looks like:
@@ -116,10 +123,9 @@ Base path: `/api/v1`
 - `GET /jobs/{job_id}/events`
 - `POST /jobs/{job_id}/retry`
 - `GET /lexicon/groups`
+- `POST /lexicon/actions`
 - `GET /lexicon/groups/{normalized_form}`
 - `GET /lexicon/groups/{normalized_form}/reference-matches`
-- `POST /lexicon/groups/ignore`
-- `POST /lexicon/groups/unignore`
 - `POST /lexemes`
 - `GET /lexemes`
 - `GET /lexemes/{lexeme_id}`
@@ -142,6 +148,43 @@ Base path: `/api/v1`
 - `GET /reference-matching/runs/{run_id}/target-results`
 - `GET /reference-matching/runs/{run_id}/target-results/{result_id}`
 - `GET /reference-matching/runs/{run_id}/events`
+- `POST /morphology/runs`
+- `GET /morphology/runs/{run_id}`
+- `GET /documents/{document_id}/morphology-summary`
+- `GET /words/{normalized_form}/morphology`
+
+## Morphology Layer
+
+The backend keeps two separate text layers:
+
+- `token_normalized` is the project’s existing normalization used for grouping and search.
+- `lemma` and `lemma_normalized` are PIE morphology outputs and are stored separately in `morphology_analyses`.
+
+PIE does not replace ingestion or grouping. It runs only on pre-tokenized inputs that already exist in the backend:
+
+- document occurrences are analyzed in document/page/token order
+- reference-source entries are tokenized first, then analyzed as token sequences
+- large runs execute asynchronously through Celery and expose progress through the existing job endpoints
+
+Morphology is intentionally gated:
+
+- use `document.language_stage=classical` or `reference_source.language_stage=classical`
+- or explicitly set `morphology_profile=xcl_pie`
+- if a scope is not eligible, tokens are stored as `skipped` instead of being sent to PIE
+
+Runtime requirements for morphology:
+
+- the worker environment must have a runnable PIE CLI binary
+- `PIE_EXECUTABLE` can be either `pie` or an absolute path to the binary
+- `PIE_MODEL_ROOT` must point at the unpacked Classical Armenian model artifacts
+
+Stored morphology fields include:
+
+- `lemma`
+- `lemma_normalized`
+- `pos`
+- `morph_features`
+- analyzer metadata such as provider, model key, version, and status
 
 ## Upload Example
 
@@ -173,10 +216,11 @@ After ingestion completes, you can browse grouped normalized forms, triage noise
 curl -H "Authorization: Bearer $SUPABASE_ACCESS_TOKEN" \
   "http://127.0.0.1:8000/api/v1/lexicon/groups?view=candidates&limit=20&offset=0"
 
-curl -X POST "http://127.0.0.1:8000/api/v1/lexicon/groups/ignore" \
+curl -X POST "http://127.0.0.1:8000/api/v1/lexicon/actions" \
   -H "Authorization: Bearer $SUPABASE_ACCESS_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
+    "action": "ignore",
     "normalized_forms": ["xv", "abbr123"],
     "reviewer_note": "OCR noise"
   }'
@@ -234,7 +278,7 @@ python -m app.scripts.reprocess_document <document_id>
 
 6. Use `view=suspicious` to review Latin, mixed-script, digit-mixed, or other suspicious groups separately from the normal reviewer queue.
 
-7. Use `/api/v1/lexicon/groups/ignore` and `/api/v1/lexicon/groups/unignore` to bulk hide or restore noise groups without deleting raw evidence.
+7. Use `/api/v1/lexicon/actions` to bulk hide, restore, create, or merge groups without deleting raw evidence.
 
 8. Create curated lexemes with `/api/v1/lexemes` or merge additional normalized forms into an existing lexeme with `/api/v1/lexemes/{lexeme_id}/merge-groups`.
 
@@ -415,7 +459,8 @@ python -m app.scripts.reprocess_document <document_id>
 - `reconstructed_text` is the reviewer-facing and tokenization-facing page text for MVP.
 - `document_pages.extracted_text` is kept for backward compatibility and mirrors `reconstructed_text` going forward.
 - `occurrences` are created automatically during ingestion and now include lightweight token classification metadata such as `script_type`, digit flags, and token length.
-- lexicon groups are derived at query time by grouping `occurrences.normalized_token` for the current user.
+- `lexicon_group_index` and `lexicon_group_index_documents` store a denormalized read model for fast lexicon list queries; `occurrences` remain the source of truth.
+- lexicon groups are always surfaced from `lexicon_group_index` (incremental updates on ingest; repair via rebuild/backfill scripts).
 - grouped normalized forms are the review unit surfaced in the lexicon queue.
 - `lexemes` are manual editorial entities created by the user.
 - `lexeme_forms` map normalized forms to curated lexemes.
@@ -450,6 +495,57 @@ python -m app.scripts.reprocess_document <document_id>
 - Reference import is still a lightweight wordlist-style ingestion path. It does not implement full structured dictionary parsing, scholarly multi-column layout understanding, or automatic extraction of dictionary articles and definitions.
 - This refinement still does not implement morphology-aware automatic merge suggestions or automatic resolution based on a trusted external hit.
 - Advanced linguistic validation and cross-page continuation handling are intentionally out of scope; only obvious same-page Armenian hyphenated line breaks are reconstructed now.
+
+## Job progress streaming
+
+- live updates: `GET /api/v1/jobs/{job_id}/stream` (SSE)
+- active jobs list: `GET /api/v1/me/active-jobs/stream` (SSE; dashboard and global job lists)
+- Celery workers publish progress events to Redis; the API stream also polls Postgres as a fallback
+- the web app uses SSE on job detail, document, and reference source pages instead of 3s polling when a job is active
+
+## Job orchestration (Phase 3)
+
+- `JobOrchestrator` centralizes Celery enqueue with `task_id=<job_id>` (idempotent retries)
+- all job start/retry paths use `get_job_orchestrator().enqueue(JobKind, job_id, kwargs=...)`
+- terminal progress still flows through `JobProgressService.complete` / `.fail`
+
+## Lexicon batch actions (Phase 5)
+
+- `POST /api/v1/lexicon/actions` — unified curation command:
+  - `ignore` / `unignore` — bulk review queue changes
+  - `create_lexeme` — create lexeme and link selected forms
+  - `merge_into_lexeme` — link forms to an existing lexeme
+
+## Lexicon Group Index
+
+- always enabled (no runtime toggle)
+- updated **incrementally per page** during ingestion and `reprocess_document` (`apply_page_occurrences`)
+- document slices store per-document `script_counts` so global rows merge from slices without rescanning `occurrences`
+- metadata refreshed when lexemes are created/merged or groups are ignored/unignored
+- `rebuild_document` / `rebuild_user` are for repair and one-time backfill only
+- **Phase 4 (scale path):** on PostgreSQL, full rebuilds use `INSERT … SELECT` projections. Incremental page updates still use the Python merge path.
+- repair endpoints:
+  - `POST /api/v1/documents/{document_id}/rebuild-index` — sync by default; `?background=true` enqueues Celery `rebuild_lexicon_index_document`
+  - `POST /api/v1/lexicon/rebuild-index` — rebuild all documents for the current user (`?background=true` for async)
+- backfill existing data after enabling the migration (not needed on every deploy):
+
+```bash
+alembic upgrade head
+python -u -m app.scripts.backfill_lexicon_group_index
+```
+
+Optional single-user rebuild:
+
+```bash
+python -u -m app.scripts.backfill_lexicon_group_index --user-id <uuid>
+```
+
+## Production (MVP)
+
+See [../docs/PRODUCTION.md](../docs/PRODUCTION.md) for deploy checklist, health probes, and **E2E acceptance tests**.
+
+- `GET /api/v1/health` — liveness
+- `GET /api/v1/health/ready` — readiness (Postgres + Redis)
 
 ## Tests
 

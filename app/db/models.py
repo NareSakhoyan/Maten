@@ -42,6 +42,16 @@ class DocumentStatus(str, enum.Enum):
     FAILED = "failed"
 
 
+class DocumentWorkflowStage(str, enum.Enum):
+    UPLOADED = "uploaded"
+    INGESTING = "ingesting"
+    READY_FOR_REVIEW = "ready_for_review"
+    IN_REVIEW = "in_review"
+    CURATED_PARTIAL = "curated_partial"
+    CURATED_COMPLETE = "curated_complete"
+    FAILED = "failed"
+
+
 class ExtractionMethod(str, enum.Enum):
     PDF_TEXT = "pdf_text"
     OCR = "ocr"
@@ -139,6 +149,7 @@ class JobKind(str, enum.Enum):
     INGESTION = "ingestion"
     REFERENCE_IMPORT = "reference_import"
     REFERENCE_MATCHING = "reference_matching"
+    MORPHOLOGY = "morphology"
 
 
 class JobResultResourceType(str, enum.Enum):
@@ -158,6 +169,19 @@ class ExternalLookupStatus(str, enum.Enum):
     FAILED = "failed"
 
 
+class MorphologyRunStatus(str, enum.Enum):
+    QUEUED = "queued"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
+class MorphologyAnalysisStatus(str, enum.Enum):
+    COMPLETED = "completed"
+    FAILED = "failed"
+    SKIPPED = "skipped"
+
+
 class Document(UpdatedTimestampMixin, Base):
     __tablename__ = "documents"
 
@@ -171,6 +195,8 @@ class Document(UpdatedTimestampMixin, Base):
     storage_path: Mapped[str] = mapped_column(String(1024), nullable=False)
     sha256: Mapped[str] = mapped_column(String(64), nullable=False)
     page_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    language_stage: Mapped[str | None] = mapped_column(Text, nullable=True)
+    morphology_profile: Mapped[str | None] = mapped_column(Text, nullable=True)
     status: Mapped[DocumentStatus] = mapped_column(
         SqlEnum(
             DocumentStatus,
@@ -194,6 +220,121 @@ class Document(UpdatedTimestampMixin, Base):
     jobs: Mapped[list["IngestionJob"]] = relationship(
         back_populates="document",
         cascade="all, delete-orphan",
+    )
+    morphology_runs: Mapped[list["MorphologyRun"]] = relationship(
+        back_populates="document",
+        cascade="all, delete-orphan",
+    )
+    morphology_analyses: Mapped[list["MorphologyAnalysis"]] = relationship(
+        back_populates="document",
+        cascade="all, delete-orphan",
+    )
+    workflow: Mapped["DocumentWorkflow | None"] = relationship(
+        back_populates="document",
+        cascade="all, delete-orphan",
+        uselist=False,
+    )
+
+
+class DocumentWorkflow(UpdatedTimestampMixin, Base):
+    __tablename__ = "document_workflows"
+    __table_args__ = (
+        Index("ix_document_workflows_user_id", "user_id"),
+        Index("ix_document_workflows_user_stage", "user_id", "stage"),
+        Index("ix_document_workflows_last_activity", "last_activity_at"),
+    )
+
+    document_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("documents.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    stage: Mapped[DocumentWorkflowStage] = mapped_column(
+        SqlEnum(
+            DocumentWorkflowStage,
+            name="document_workflow_stage",
+            values_callable=enum_values,
+            validate_strings=True,
+        ),
+        nullable=False,
+        default=DocumentWorkflowStage.UPLOADED,
+    )
+    candidate_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    linked_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    ignored_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    suspicious_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    last_job_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    last_activity_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
+
+    document: Mapped["Document"] = relationship(back_populates="workflow")
+
+
+class LexiconGroupIndex(Base):
+    __tablename__ = "lexicon_group_index"
+    __table_args__ = (
+        Index("ix_lexicon_group_index_user_state_script", "user_id", "group_state", "dominant_script_type"),
+        Index("ix_lexicon_group_index_user_occurrence_count", "user_id", "occurrence_count"),
+        Index("ix_lexicon_group_index_user_normalized_form", "user_id", "normalized_form"),
+    )
+
+    user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    normalized_form: Mapped[str] = mapped_column(Text, primary_key=True)
+    occurrence_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    document_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    page_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    dominant_script_type: Mapped[OccurrenceScriptType] = mapped_column(
+        SqlEnum(
+            OccurrenceScriptType,
+            name="occurrence_script_type",
+            values_callable=enum_values,
+            validate_strings=True,
+        ),
+        nullable=False,
+    )
+    group_state: Mapped[str] = mapped_column(Text, nullable=False, default="unreviewed")
+    linked_lexeme_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    linked_lexeme_canonical_form: Mapped[str | None] = mapped_column(Text, nullable=True)
+    sample_tokens: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
+    sample_contexts: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
+    sample_document_titles: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
+    script_counts: Mapped[dict[str, int]] = mapped_column(JSON, nullable=False, default=dict)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
+
+class LexiconGroupIndexDocument(Base):
+    __tablename__ = "lexicon_group_index_documents"
+    __table_args__ = (
+        Index("ix_lexicon_group_index_documents_document", "user_id", "document_id"),
+    )
+
+    user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    normalized_form: Mapped[str] = mapped_column(Text, primary_key=True)
+    document_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("documents.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    occurrence_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    page_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    sample_tokens: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
+    sample_contexts: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
+    page_ids: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
+    script_counts: Mapped[dict[str, int]] = mapped_column(JSON, nullable=False, default=dict)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
     )
 
 
@@ -229,6 +370,10 @@ class DocumentPage(TimestampMixin, Base):
 
     document: Mapped["Document"] = relationship(back_populates="pages")
     occurrences: Mapped[list["Occurrence"]] = relationship(
+        back_populates="page",
+        cascade="all, delete-orphan",
+    )
+    morphology_analyses: Mapped[list["MorphologyAnalysis"]] = relationship(
         back_populates="page",
         cascade="all, delete-orphan",
     )
@@ -283,6 +428,10 @@ class Occurrence(TimestampMixin, Base):
     document: Mapped["Document"] = relationship(back_populates="occurrences")
     page: Mapped["DocumentPage"] = relationship(back_populates="occurrences")
     lexeme: Mapped["Lexeme | None"] = relationship(back_populates="occurrences")
+    morphology_analyses: Mapped[list["MorphologyAnalysis"]] = relationship(
+        back_populates="occurrence",
+        cascade="all, delete-orphan",
+    )
 
 
 class Lexeme(UpdatedTimestampMixin, Base):
@@ -386,6 +535,8 @@ class ReferenceSource(UpdatedTimestampMixin, Base):
         default=ReferenceSourceType.IMPORTED_WORDLIST,
     )
     language: Mapped[str | None] = mapped_column(Text, nullable=True)
+    language_stage: Mapped[str | None] = mapped_column(Text, nullable=True)
+    morphology_profile: Mapped[str | None] = mapped_column(Text, nullable=True)
     is_active: Mapped[bool] = mapped_column(default=True, nullable=False)
     last_import_method: Mapped[ReferenceImportMethod | None] = mapped_column(
         SqlEnum(
@@ -416,6 +567,14 @@ class ReferenceSource(UpdatedTimestampMixin, Base):
     run_results: Mapped[list["ReferenceMatchRunResult"]] = relationship(
         back_populates="best_source",
         foreign_keys="ReferenceMatchRunResult.best_source_id",
+    )
+    morphology_runs: Mapped[list["MorphologyRun"]] = relationship(
+        back_populates="reference_source",
+        cascade="all, delete-orphan",
+    )
+    morphology_analyses: Mapped[list["MorphologyAnalysis"]] = relationship(
+        back_populates="reference_source",
+        cascade="all, delete-orphan",
     )
 
 
@@ -448,6 +607,143 @@ class ReferenceEntry(UpdatedTimestampMixin, Base):
         back_populates="reference_entry",
         cascade="all, delete-orphan",
     )
+    morphology_analyses: Mapped[list["MorphologyAnalysis"]] = relationship(
+        back_populates="reference_entry",
+        cascade="all, delete-orphan",
+    )
+
+
+class MorphologyRun(UpdatedTimestampMixin, Base):
+    __tablename__ = "morphology_runs"
+    __table_args__ = (
+        Index("ix_morphology_runs_user_id", "user_id"),
+        Index("ix_morphology_runs_document_id", "document_id"),
+        Index("ix_morphology_runs_reference_source_id", "reference_source_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id: Mapped[str] = mapped_column(Text, nullable=False)
+    document_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("documents.id", ondelete="CASCADE"),
+        nullable=True,
+    )
+    reference_source_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("reference_sources.id", ondelete="CASCADE"),
+        nullable=True,
+    )
+    source_type: Mapped[str] = mapped_column(Text, nullable=False)
+    analyzer_provider: Mapped[str] = mapped_column(Text, nullable=False, default="pie")
+    analyzer_model_key: Mapped[str] = mapped_column(Text, nullable=False)
+    analyzer_version: Mapped[str | None] = mapped_column(Text, nullable=True)
+    status: Mapped[MorphologyRunStatus] = mapped_column(
+        SqlEnum(
+            MorphologyRunStatus,
+            name="morphology_run_status",
+            values_callable=enum_values,
+            validate_strings=True,
+        ),
+        nullable=False,
+        default=MorphologyRunStatus.QUEUED,
+    )
+    completed_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    skipped_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    failed_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    current_stage_code: Mapped[str | None] = mapped_column(Text, nullable=True)
+    current_stage_label: Mapped[str | None] = mapped_column(Text, nullable=True)
+    stage_message_user: Mapped[str | None] = mapped_column(Text, nullable=True)
+    progress_percent: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    items_processed: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    items_total: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    error_code: Mapped[str | None] = mapped_column(Text, nullable=True)
+    error_message_user: Mapped[str | None] = mapped_column(Text, nullable=True)
+    next_steps: Mapped[list[str] | None] = mapped_column(JSON, nullable=True)
+    result_resource_type: Mapped[JobResultResourceType | None] = mapped_column(
+        SqlEnum(
+            JobResultResourceType,
+            name="job_result_resource_type",
+            values_callable=enum_values,
+            validate_strings=True,
+        ),
+        nullable=True,
+    )
+    result_resource_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    retry_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    can_retry: Mapped[bool] = mapped_column(nullable=False, default=False)
+    last_retried_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    document: Mapped["Document | None"] = relationship(back_populates="morphology_runs")
+    reference_source: Mapped["ReferenceSource | None"] = relationship(back_populates="morphology_runs")
+
+
+class MorphologyAnalysis(UpdatedTimestampMixin, Base):
+    __tablename__ = "morphology_analyses"
+    __table_args__ = (
+        Index("ix_morphology_analyses_occurrence_id", "occurrence_id"),
+        Index("ix_morphology_analyses_reference_entry_id", "reference_entry_id"),
+        Index("ix_morphology_analyses_token_normalized", "token_normalized"),
+        Index("ix_morphology_analyses_lemma_normalized", "lemma_normalized"),
+        Index("ix_morphology_analyses_user_document", "user_id", "document_id"),
+        Index("ix_morphology_analyses_reference_source_id", "reference_source_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id: Mapped[str] = mapped_column(Text, nullable=False, index=True)
+    occurrence_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("occurrences.id", ondelete="CASCADE"),
+        nullable=True,
+    )
+    document_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("documents.id", ondelete="CASCADE"),
+        nullable=True,
+    )
+    page_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("document_pages.id", ondelete="CASCADE"),
+        nullable=True,
+    )
+    reference_source_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("reference_sources.id", ondelete="CASCADE"),
+        nullable=True,
+    )
+    reference_entry_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("reference_entries.id", ondelete="CASCADE"),
+        nullable=True,
+    )
+    source_type: Mapped[str] = mapped_column(Text, nullable=False)
+    token_surface: Mapped[str] = mapped_column(Text, nullable=False)
+    token_normalized: Mapped[str] = mapped_column(Text, nullable=False)
+    lemma: Mapped[str | None] = mapped_column(Text, nullable=True)
+    lemma_normalized: Mapped[str | None] = mapped_column(Text, nullable=True)
+    pos: Mapped[str | None] = mapped_column(Text, nullable=True)
+    morph_features: Mapped[dict[str, object] | None] = mapped_column(JSON, nullable=True)
+    analyzer_provider: Mapped[str] = mapped_column(Text, nullable=False, default="pie")
+    analyzer_model_key: Mapped[str] = mapped_column(Text, nullable=False)
+    analyzer_version: Mapped[str | None] = mapped_column(Text, nullable=True)
+    analysis_status: Mapped[MorphologyAnalysisStatus] = mapped_column(
+        SqlEnum(
+            MorphologyAnalysisStatus,
+            name="morphology_analysis_status",
+            values_callable=enum_values,
+            validate_strings=True,
+        ),
+        nullable=False,
+    )
+    failure_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    occurrence: Mapped["Occurrence | None"] = relationship(back_populates="morphology_analyses")
+    document: Mapped["Document | None"] = relationship(back_populates="morphology_analyses")
+    page: Mapped["DocumentPage | None"] = relationship(back_populates="morphology_analyses")
+    reference_source: Mapped["ReferenceSource | None"] = relationship(back_populates="morphology_analyses")
+    reference_entry: Mapped["ReferenceEntry | None"] = relationship(back_populates="morphology_analyses")
 
 
 class ReferenceMatchRun(UpdatedTimestampMixin, Base):

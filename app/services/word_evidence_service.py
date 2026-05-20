@@ -19,6 +19,7 @@ from app.schemas.word import (
     WordEvidenceSummary,
 )
 from app.services.external_lookup_service import ExternalLookupBatch, ExternalLookupService, get_external_lookup_service
+from app.services.morphology.morphology_service import MorphologyService, get_morphology_service
 from app.services.reference_matching_service import ReferenceMatchingService, get_reference_matching_service
 from app.utils.text_normalization import normalize_token
 from app.utils.token_classification import classify_token, is_suspicious_script_type, suspicion_reasons_for_script_type
@@ -30,9 +31,11 @@ class WordEvidenceService:
         *,
         reference_matching_service: ReferenceMatchingService | None = None,
         external_lookup_service: ExternalLookupService | None = None,
+        morphology_service: MorphologyService | None = None,
     ) -> None:
         self.reference_matching_service = reference_matching_service or get_reference_matching_service()
         self.external_lookup_service = external_lookup_service or get_external_lookup_service()
+        self.morphology_service = morphology_service or get_morphology_service()
 
     def get_word_evidence(
         self,
@@ -54,6 +57,11 @@ class WordEvidenceService:
         lexeme_map = self.matching_lexeme_map(session, user_id=user_id, normalized_forms=[normalized])
         matching_lexemes = lexeme_map.get(normalized, [])
         related_lexeme_summary = self._related_lexeme_summary(session, lexeme=matching_lexemes[0]) if matching_lexemes else None
+        morphology_summary = self.morphology_service.get_word_evidence_summary(
+            session,
+            user_id=user_id,
+            normalized_form=normalized,
+        )
 
         evidence_items: list[WordEvidenceItem] = []
         if source_type in {None, WordEvidenceSourceType.IMPORTED_BOOK}:
@@ -124,6 +132,10 @@ class WordEvidenceService:
                 linked_lexeme_canonical_form=(
                     related_lexeme_summary.canonical_form if related_lexeme_summary is not None else None
                 ),
+                best_lemma=morphology_summary.best_lemma,
+                lemma_candidates=morphology_summary.lemma_candidates,
+                pos_candidates=morphology_summary.pos_candidates,
+                morphology_available=morphology_summary.morphology_available,
             ),
             evidence_items=paged_items,
             external_summary=WordEvidenceExternalSummary(

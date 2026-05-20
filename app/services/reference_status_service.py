@@ -82,7 +82,7 @@ class ReferenceStatusService:
             normalized_form = row["normalized_form"]
             if not normalized_form:
                 continue
-            covered_keys.add(normalized_form)
+            covered_keys.add(str(normalized_form))
             if row["match_status"] == ReferenceMatchStatus.MATCHED:
                 rows_by_key[normalized_form].append(row)
 
@@ -97,16 +97,14 @@ class ReferenceStatusService:
                 ),
             )
 
-        fallback_keys = [key for key in keys if key not in covered_keys]
-        if fallback_keys:
-            summaries.update(
-                self._legacy_summary_map(
-                    session,
-                    user_id=user_id,
-                    target_type=ReferenceMatchTargetType.LEXICON_GROUP,
-                    target_keys=fallback_keys,
-                )
-            )
+        for key, direct_summary in self._direct_summary_map(
+            session,
+            user_id=user_id,
+            target_type=ReferenceMatchTargetType.LEXICON_GROUP,
+            target_keys=[key for key in keys if key not in covered_keys],
+        ).items():
+            if not summaries[key].has_reference_match:
+                summaries[key] = direct_summary
         return summaries
 
     def lexeme_summary_map(
@@ -144,8 +142,8 @@ class ReferenceStatusService:
             .where(latest.c.normalized_form.in_(tracked_values))
         ).mappings().all()
 
-        covered_keys: set[str] = set()
         matched_by_lexeme: dict[str, dict[UUID, dict[str, object]]] = defaultdict(dict)
+        covered_keys: set[str] = set()
         for row in latest_rows:
             normalized_form = row["normalized_form"]
             if not normalized_form:
@@ -173,16 +171,14 @@ class ReferenceStatusService:
                 ),
             )
 
-        fallback_keys = [key for key in keys if key not in covered_keys]
-        if fallback_keys:
-            summaries.update(
-                self._legacy_summary_map(
-                    session,
-                    user_id=user_id,
-                    target_type=ReferenceMatchTargetType.LEXEME,
-                    target_keys=fallback_keys,
-                )
-            )
+        for key, direct_summary in self._direct_summary_map(
+            session,
+            user_id=user_id,
+            target_type=ReferenceMatchTargetType.LEXEME,
+            target_keys=[key for key in keys if key not in covered_keys],
+        ).items():
+            if not summaries[key].has_reference_match:
+                summaries[key] = direct_summary
         return summaries
 
     def reference_entry_summary_map(
@@ -270,24 +266,22 @@ class ReferenceStatusService:
                 source_warning=row["source_warning"],
             )
 
-        missing_keys = [entry_id for entry_id in keys if entry_id not in covered_keys]
-        if not missing_keys:
-            return summaries
-
-        legacy_rows = session.execute(
+        direct_rows = session.execute(
             select(ReferenceMatch, ReferenceSource.display_name)
-            .join(ReferenceSource, ReferenceSource.id == ReferenceMatch.source_id)
+            .join(ReferenceSource, ReferenceMatch.source_id == ReferenceSource.id)
             .where(
                 ReferenceMatch.user_id == str(user_id),
-                ReferenceMatch.reference_entry_id.in_(missing_keys),
+                ReferenceMatch.reference_entry_id.in_(keys),
+                ~ReferenceMatch.reference_entry_id.in_(covered_keys),
             )
         ).all()
-        grouped: dict[UUID, list[tuple[ReferenceMatch, str]]] = defaultdict(list)
-        for match, display_name in legacy_rows:
-            grouped[match.reference_entry_id].append((match, display_name))
+        grouped_direct: dict[UUID, list[tuple[ReferenceMatch, str]]] = defaultdict(list)
+        for match, display_name in direct_rows:
+            if match.reference_entry_id is not None and not summaries[match.reference_entry_id].has_reference_match:
+                grouped_direct[match.reference_entry_id].append((match, display_name))
 
-        for entry_id, rows in grouped.items():
-            best_match_row, best_display_name = min(rows, key=lambda value: self._legacy_sort_key(value[0], value[1]))
+        for entry_id, rows in grouped_direct.items():
+            best_match_row, best_display_name = min(rows, key=lambda value: self._direct_sort_key(value[0], value[1]))
             summaries[entry_id] = ReferenceEntryStatusSummary(
                 has_reference_match=True,
                 reference_match_count=len(rows),
@@ -340,7 +334,7 @@ class ReferenceStatusService:
         else:
             raise ValueError("Unsupported target type for matched_target_keys_subquery.")
 
-        legacy_fallback = (
+        direct_matched = (
             select(ReferenceMatch.target_key)
             .where(
                 ReferenceMatch.user_id == str(user_id),
@@ -349,33 +343,31 @@ class ReferenceStatusService:
             )
             .distinct()
         )
-        return source_first_matched.union(legacy_fallback)
+        return source_first_matched.union(direct_matched)
 
     def matched_reference_entry_ids_subquery(self, *, user_id: UUID, source_id: UUID | None = None):
         latest = self._latest_results_subquery(user_id)
         source_first_filters = [latest.c.reference_entry_id.is_not(None)]
-        legacy_filters = [
-            ReferenceMatch.user_id == str(user_id),
-            ReferenceMatch.reference_entry_id.is_not(None),
-        ]
         if source_id is not None:
             source_first_filters.append(latest.c.source_id == source_id)
-            legacy_filters.append(ReferenceMatch.source_id == source_id)
 
-        source_first_covered = select(latest.c.reference_entry_id).where(*source_first_filters).distinct()
         source_first_matched = (
             select(latest.c.reference_entry_id)
             .where(*source_first_filters, latest.c.match_status == ReferenceMatchStatus.MATCHED)
             .distinct()
         )
-        legacy_fallback = (
-            select(ReferenceMatch.reference_entry_id)
-            .where(*legacy_filters, ~ReferenceMatch.reference_entry_id.in_(source_first_covered))
-            .distinct()
-        )
-        return source_first_matched.union(legacy_fallback)
+        source_first_covered = select(latest.c.reference_entry_id).where(*source_first_filters).distinct()
+        direct_filters = [
+            ReferenceMatch.user_id == str(user_id),
+            ReferenceMatch.reference_entry_id.is_not(None),
+            ~ReferenceMatch.reference_entry_id.in_(source_first_covered),
+        ]
+        if source_id is not None:
+            direct_filters.append(ReferenceMatch.source_id == source_id)
+        direct_matched = select(ReferenceMatch.reference_entry_id).where(*direct_filters).distinct()
+        return source_first_matched.union(direct_matched)
 
-    def _legacy_summary_map(
+    def _direct_summary_map(
         self,
         session: Session,
         *,
@@ -402,9 +394,7 @@ class ReferenceStatusService:
             grouped[match.target_key].append((match, display_name))
 
         for key, values in grouped.items():
-            if not values:
-                continue
-            best_match_row, best_display_name = min(values, key=lambda value: self._legacy_sort_key(value[0], value[1]))
+            best_match_row, best_display_name = min(values, key=lambda value: self._direct_sort_key(value[0], value[1]))
             summaries[key] = StoredReferenceSummary(
                 has_reference_match=True,
                 reference_match_count=len(values),
@@ -447,7 +437,7 @@ class ReferenceStatusService:
         )
 
     @staticmethod
-    def _legacy_sort_key(match: ReferenceMatch, display_name: str) -> tuple[int, float, str, str]:
+    def _direct_sort_key(match: ReferenceMatch, display_name: str) -> tuple[int, float, str, str]:
         type_priority = {
             ReferenceMatchType.EXACT: 0,
             ReferenceMatchType.NORMALIZED: 1,

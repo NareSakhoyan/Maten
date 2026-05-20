@@ -11,6 +11,7 @@ from app.core.database import session_scope
 from app.db.models import Document, DocumentPage, DocumentStatus, IngestionJob, IngestionJobStatus, JobKind, Occurrence
 from app.services.ingestion_error_service import IngestionErrorService, get_ingestion_error_service
 from app.services.job_progress_service import JobProgressService, get_job_progress_service
+from app.services.lexicon_group_index_service import get_lexicon_group_index_service
 from app.services.occurrence_service import OccurrenceService, get_occurrence_service
 from app.services.page_extraction_service import PageExtractionService, get_page_extraction_service
 from app.services.storage_service import StorageService, get_storage_service
@@ -41,6 +42,8 @@ class IngestionService:
         page_iterator = None
         page_count = 0
 
+        index_service = get_lexicon_group_index_service()
+
         try:
             with session_scope() as session:
                 job = self._load_job(session, job_uuid)
@@ -61,6 +64,13 @@ class IngestionService:
                 job.items_total = None
 
                 document.status = DocumentStatus.PROCESSING
+                from app.services.document_workflow_service import get_document_workflow_service
+
+                get_document_workflow_service().sync_for_document(
+                    session,
+                    document_id=document.id,
+                    last_job_id=job.id,
+                )
 
                 self.job_progress_service.set_stage(
                     session,
@@ -88,6 +98,11 @@ class IngestionService:
             with session_scope() as session:
                 job = self._load_job(session, job_uuid)
                 document = job.document
+                index_service.clear_document_index(
+                    session,
+                    user_id=document.user_id,
+                    document_id=document.id,
+                )
                 session.execute(delete(Occurrence).where(Occurrence.document_id == document.id))
                 session.execute(delete(DocumentPage).where(DocumentPage.document_id == document.id))
 
@@ -216,12 +231,20 @@ class IngestionService:
                         items_total=page_count,
                         append_event=False,
                     )
-                    self.occurrence_service.store_page_occurrences(
+                    occurrences = self.occurrence_service.store_page_occurrences(
                         session,
                         document_id=document.id,
                         page_id=page.id,
                         page_number=page.page_number,
                         text=page.reconstructed_text or page.extracted_text,
+                    )
+                    index_service.apply_page_occurrences(
+                        session,
+                        user_id=document.user_id,
+                        document_id=document.id,
+                        document_title=document.title,
+                        page_id=page.id,
+                        occurrences=occurrences,
                     )
 
                     processed_pages += 1
@@ -274,6 +297,13 @@ class IngestionService:
                     job_kind=JobKind.INGESTION,
                     job=job,
                 )
+                from app.services.document_workflow_service import get_document_workflow_service
+
+                get_document_workflow_service().sync_for_document(
+                    session,
+                    document_id=document.id,
+                    last_job_id=job.id,
+                )
 
         except Exception as exc:
             logger.exception("Document ingestion failed for job %s", job_uuid)
@@ -307,6 +337,13 @@ class IngestionService:
             )
             if job.document is not None:
                 job.document.status = DocumentStatus.FAILED
+                from app.services.document_workflow_service import get_document_workflow_service
+
+                get_document_workflow_service().sync_for_document(
+                    session,
+                    document_id=job.document.id,
+                    last_job_id=job.id,
+                )
 
     @staticmethod
     def _load_job(session, job_id: UUID) -> IngestionJob:

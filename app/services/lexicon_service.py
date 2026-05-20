@@ -7,33 +7,47 @@ from sqlalchemy.orm import Session
 
 from app.db.models import (
     Document,
+    DocumentPage,
     LexiconGroupReview,
     LexiconGroupReviewStatus,
     Lexeme,
     LexemeForm,
     Occurrence,
     OccurrenceScriptType,
+    ReferenceMatch,
     ReferenceMatchTargetType,
 )
 from app.schemas.lexicon import (
     LexiconGroupDetail,
     LexiconGroupOccurrenceRead,
+    LexiconGroupSortDirection,
+    LexiconGroupSortKey,
     LexiconGroupState,
     LexiconGroupSummary,
     LexiconGroupView,
 )
 from app.schemas.reference import ReferenceStatusFilter
+from app.db.models import LexiconGroupIndex
+from app.services.lexicon_group_index_service import get_lexicon_group_index_service
+from app.services.lexicon_index_query import (
+    apply_reference_status_filter,
+    build_index_list_query,
+    build_index_sort_order,
+    row_to_summary,
+)
+from app.utils.snippets import context_snippet_highlight_range
 from app.utils.text_normalization import normalize_token
 from app.utils.token_classification import is_suspicious_script_type, suspicion_reasons_for_script_type
 
 
 class LexiconService:
-    def __init__(self, *, reference_matching_service=None) -> None:
+    def __init__(self, *, reference_matching_service=None, index_service=None) -> None:
         if reference_matching_service is None:
             from app.services.reference_matching_service import ReferenceMatchingService
 
             reference_matching_service = ReferenceMatchingService(lexicon_service=self)
         self.reference_matching_service = reference_matching_service
+        self.index_service = index_service or get_lexicon_group_index_service()
 
     def list_groups(
         self,
@@ -46,70 +60,93 @@ class LexiconService:
         view: LexiconGroupView = LexiconGroupView.CANDIDATES,
         document_id: UUID | None = None,
         reference_status: ReferenceStatusFilter = ReferenceStatusFilter.ALL,
+        sort_by: LexiconGroupSortKey | None = None,
+        sort_dir: LexiconGroupSortDirection = LexiconGroupSortDirection.DESC,
+        include_reference_summary: bool = False,
     ) -> tuple[list[LexiconGroupSummary], int]:
-        group_subquery = self._build_group_subquery(
+        needs_reference_summary = include_reference_summary or reference_status is not ReferenceStatusFilter.ALL
+        return self._list_groups_from_index(
+            session,
             user_id=user_id,
+            limit=limit,
+            offset=offset,
             search=search,
+            view=view,
             document_id=document_id,
-        )
-        filters = self._view_filters(group_subquery, view)
-        filters.extend(
-            self._reference_status_filters(
-                session,
-                group_subquery,
-                user_id=user_id,
-                reference_status=reference_status,
-            )
+            reference_status=reference_status,
+            sort_by=sort_by,
+            sort_dir=sort_dir,
+            include_reference_summary=needs_reference_summary,
         )
 
-        total = session.scalar(select(func.count()).select_from(group_subquery).where(*filters)) or 0
-        rows = session.execute(
-            select(group_subquery)
-            .where(*filters)
-            .order_by(
-                group_subquery.c.occurrence_count.desc(),
-                group_subquery.c.normalized_form.asc(),
+    def _list_groups_from_index(
+        self,
+        session: Session,
+        *,
+        user_id: UUID,
+        limit: int,
+        offset: int,
+        search: str | None,
+        view: LexiconGroupView,
+        document_id: UUID | None,
+        reference_status: ReferenceStatusFilter,
+        sort_by: LexiconGroupSortKey | None,
+        sort_dir: LexiconGroupSortDirection,
+        include_reference_summary: bool = False,
+    ) -> tuple[list[LexiconGroupSummary], int]:
+        needs_reference_summary = include_reference_summary or reference_status is not ReferenceStatusFilter.ALL
+        subquery = build_index_list_query(
+            user_id=user_id,
+            search=search,
+            view=view,
+            document_id=document_id,
+        )
+        filters: list[object] = []
+        match_keys = None
+        if reference_status is not ReferenceStatusFilter.ALL:
+            match_keys = self.reference_matching_service.reference_status_filter_for_session(
+                session,
+                user_id=user_id,
+                target_type=ReferenceMatchTargetType.LEXICON_GROUP,
             )
+            filters.extend(
+                apply_reference_status_filter(
+                    subquery,
+                    reference_status=reference_status,
+                    match_keys=match_keys,
+                )
+            )
+
+        total = session.scalar(select(func.count()).select_from(subquery).where(*filters)) or 0
+        rows = session.execute(
+            select(subquery)
+            .where(*filters)
+            .order_by(*build_index_sort_order(subquery, sort_by=sort_by, sort_dir=sort_dir))
             .limit(limit)
             .offset(offset)
         ).all()
 
-        reference_summary_map = self.reference_matching_service.group_summary_map(
-            session,
-            user_id=user_id,
-            normalized_forms=[row.normalized_form for row in rows],
-        )
-        items: list[LexiconGroupSummary] = []
-        for row in rows:
-            sample_tokens, sample_contexts, sample_document_titles = self._load_group_samples(
+        normalized_forms_page = [row.normalized_form for row in rows]
+        if not normalized_forms_page:
+            return [], total
+
+        reference_summary_map = (
+            self.reference_matching_service.group_summary_map(
                 session,
                 user_id=user_id,
-                normalized_form=row.normalized_form,
+                normalized_forms=normalized_forms_page,
+            )
+            if needs_reference_summary
+            else {}
+        )
+        items = [
+            row_to_summary(
+                row,
                 document_id=document_id,
+                reference_summary=reference_summary_map.get(row.normalized_form),
             )
-            dominant_script_type = OccurrenceScriptType(row.dominant_script_type)
-            reference_summary = reference_summary_map[row.normalized_form]
-            items.append(
-                LexiconGroupSummary(
-                    normalized_form=row.normalized_form,
-                    occurrence_count=row.occurrence_count,
-                    document_count=row.document_count,
-                    page_count=row.page_count,
-                    sample_tokens=sample_tokens,
-                    sample_contexts=sample_contexts,
-                    sample_document_titles=sample_document_titles,
-                    linked_lexeme_id=row.linked_lexeme_id,
-                    linked_lexeme_canonical_form=row.linked_lexeme_canonical_form,
-                    group_state=LexiconGroupState(row.group_state),
-                    dominant_script_type=dominant_script_type,
-                    is_suspicious=is_suspicious_script_type(dominant_script_type),
-                    suspicion_reasons=suspicion_reasons_for_script_type(dominant_script_type),
-                    has_reference_match=reference_summary.has_reference_match,
-                    reference_match_count=reference_summary.reference_match_count,
-                    best_reference_match=reference_summary.best_reference_match,
-                )
-            )
-
+            for row in rows
+        ]
         return items, total
 
     def get_group_detail(
@@ -124,59 +161,92 @@ class LexiconService:
         if not normalized:
             return None
 
-        group_subquery = self._build_group_subquery(user_id=user_id, search=None, document_id=None)
-        row = session.execute(
-            select(group_subquery).where(group_subquery.c.normalized_form == normalized)
-        ).one_or_none()
+        row = session.get(
+            LexiconGroupIndex,
+            {"user_id": user_id, "normalized_form": normalized},
+        )
         if row is None:
             return None
 
-        occurrences = [
-            LexiconGroupOccurrenceRead(
-                id=occurrence.id,
-                document_id=occurrence.document_id,
-                document_title=occurrence.document_title,
-                original_filename=occurrence.original_filename,
-                page_id=occurrence.page_id,
-                page_number=occurrence.page_number,
-                token=occurrence.token,
-                normalized_token=occurrence.normalized_token,
-                context_snippet=occurrence.context_snippet,
-                created_at=occurrence.created_at,
+        occurrence_rows = session.execute(
+            select(
+                Occurrence.id.label("id"),
+                Occurrence.document_id.label("document_id"),
+                Document.title.label("document_title"),
+                Document.original_filename.label("original_filename"),
+                Occurrence.page_id.label("page_id"),
+                Occurrence.page_number.label("page_number"),
+                DocumentPage.page_image_bucket.label("page_image_bucket"),
+                DocumentPage.page_image_path.label("page_image_path"),
+                Occurrence.token.label("token"),
+                Occurrence.normalized_token.label("normalized_token"),
+                Occurrence.context_snippet.label("context_snippet"),
+                Occurrence.char_start.label("char_start"),
+                Occurrence.char_end.label("char_end"),
+                DocumentPage.raw_extracted_text.label("page_text"),
+                Occurrence.created_at.label("created_at"),
             )
-            for occurrence in session.execute(
-                select(
-                    Occurrence.id.label("id"),
-                    Occurrence.document_id.label("document_id"),
-                    Document.title.label("document_title"),
-                    Document.original_filename.label("original_filename"),
-                    Occurrence.page_id.label("page_id"),
-                    Occurrence.page_number.label("page_number"),
-                    Occurrence.token.label("token"),
-                    Occurrence.normalized_token.label("normalized_token"),
-                    Occurrence.context_snippet.label("context_snippet"),
-                    Occurrence.created_at.label("created_at"),
-                )
-                .join(Document, Occurrence.document_id == Document.id)
-                .where(
-                    Document.user_id == user_id,
-                    Occurrence.normalized_token == normalized,
-                )
-                .order_by(
-                    Occurrence.page_number.asc(),
-                    Occurrence.char_start.asc().nullsfirst(),
-                    Occurrence.created_at.asc(),
-                )
-                .limit(occurrence_cap)
-            ).all()
-        ]
+            .join(Document, Occurrence.document_id == Document.id)
+            .join(DocumentPage, Occurrence.page_id == DocumentPage.id)
+            .where(
+                Document.user_id == user_id,
+                Occurrence.normalized_token == normalized,
+            )
+            .order_by(
+                Occurrence.page_number.asc(),
+                Occurrence.char_start.asc().nullsfirst(),
+                Occurrence.created_at.asc(),
+            )
+            .limit(occurrence_cap)
+        ).all()
 
-        dominant_script_type = OccurrenceScriptType(row.dominant_script_type)
+        occurrences = []
+        for occurrence in occurrence_rows:
+            highlight_start, highlight_end = context_snippet_highlight_range(
+                occurrence.page_text,
+                occurrence.char_start,
+                occurrence.char_end,
+                occurrence.context_snippet,
+                token=occurrence.token,
+            )
+            occurrences.append(
+                LexiconGroupOccurrenceRead(
+                    id=occurrence.id,
+                    document_id=occurrence.document_id,
+                    document_title=occurrence.document_title,
+                    original_filename=occurrence.original_filename,
+                    page_id=occurrence.page_id,
+                    page_number=occurrence.page_number,
+                    page_image_available=bool(occurrence.page_image_bucket and occurrence.page_image_path),
+                    page_image_api_path=(
+                        f"/api/v1/documents/{occurrence.document_id}/pages/{occurrence.page_id}/image"
+                        if occurrence.page_image_bucket and occurrence.page_image_path
+                        else None
+                    ),
+                    token=occurrence.token,
+                    normalized_token=occurrence.normalized_token,
+                    context_snippet=occurrence.context_snippet,
+                    context_highlight_start=highlight_start,
+                    context_highlight_end=highlight_end,
+                    created_at=occurrence.created_at,
+                )
+            )
+
+        dominant_script_type = (
+            row.dominant_script_type
+            if isinstance(row.dominant_script_type, OccurrenceScriptType)
+            else OccurrenceScriptType(row.dominant_script_type)
+        )
         reference_summary = self.reference_matching_service.group_summary_map(
             session,
             user_id=user_id,
             normalized_forms=[normalized],
         )[normalized]
+        group_state = (
+            LexiconGroupState(row.group_state)
+            if isinstance(row.group_state, str)
+            else LexiconGroupState(row.group_state.value)
+        )
         return LexiconGroupDetail(
             normalized_form=row.normalized_form,
             occurrence_count=row.occurrence_count,
@@ -184,7 +254,7 @@ class LexiconService:
             page_count=row.page_count,
             linked_lexeme_id=row.linked_lexeme_id,
             linked_lexeme_canonical_form=row.linked_lexeme_canonical_form,
-            group_state=LexiconGroupState(row.group_state),
+            group_state=group_state,
             dominant_script_type=dominant_script_type,
             is_suspicious=is_suspicious_script_type(dominant_script_type),
             suspicion_reasons=suspicion_reasons_for_script_type(dominant_script_type),
@@ -355,22 +425,16 @@ class LexiconService:
         seen_contexts: set[str] = set()
         seen_titles: set[str] = set()
 
-        for row in rows:
-            if row.token not in seen_tokens and len(sample_tokens) < 5:
-                seen_tokens.add(row.token)
-                sample_tokens.append(row.token)
-            if row.context_snippet not in seen_contexts and len(sample_contexts) < 5:
-                seen_contexts.add(row.context_snippet)
-                sample_contexts.append(row.context_snippet)
-            if row.title not in seen_titles and len(sample_document_titles) < 5:
-                seen_titles.add(row.title)
-                sample_document_titles.append(row.title)
-            if (
-                len(sample_tokens) >= 5
-                and len(sample_contexts) >= 5
-                and len(sample_document_titles) >= 5
-            ):
-                break
+        for token, context_snippet, title in rows:
+            if token not in seen_tokens and len(sample_tokens) < 5:
+                seen_tokens.add(token)
+                sample_tokens.append(token)
+            if context_snippet not in seen_contexts and len(sample_contexts) < 5:
+                seen_contexts.add(context_snippet)
+                sample_contexts.append(context_snippet)
+            if title not in seen_titles and len(sample_document_titles) < 5:
+                seen_titles.add(title)
+                sample_document_titles.append(title)
 
         return sample_tokens, sample_contexts, sample_document_titles
 

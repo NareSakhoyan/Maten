@@ -58,5 +58,16 @@ class LexemeMergeGroupsRequest(APIModel):
     normalized_forms: list[str] = Field(min_length=1)
 
 
+class LexemePickerItem(APIModel):
+    id: UUID
+    canonical_form: str
+    canonical_normalized_form: str
+    status: LexemeStatus
+
+
+class LexemePickerListResponse(OffsetPagination):
+    items: list[LexemePickerItem]
+
+
 class LexemeListResponse(OffsetPagination):
     items: list[LexemeSummary]
