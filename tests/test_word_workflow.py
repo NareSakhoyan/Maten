@@ -3,14 +3,22 @@ from __future__ import annotations
 import asyncio
 from uuid import UUID, uuid4
 
-from sqlalchemy import delete
+from sqlalchemy import delete, select
 
 from app.api.routers.documents import get_document, list_document_word_candidates
 from app.api.routers.reference_sources import get_reference_source, list_reference_source_word_candidates
 from app.db.models import ReferenceMatchingDirection
 from app.api.routers.words import check_word, get_word_evidence, search_words
 from app.db.models import ReferenceMatchType
-from app.db.models import Document, DocumentPage, DocumentStatus, LexemeStatus, Occurrence
+from app.db.models import (
+    Document,
+    DocumentPage,
+    DocumentStatus,
+    LexemeStatus,
+    MorphologyAnalysis,
+    MorphologyAnalysisStatus,
+    Occurrence,
+)
 from app.schemas.lexeme import LexemeCreateRequest
 from app.schemas.reference import ReferenceMatchRunCreateRequest, ReferenceSourceCreateRequest, ReferenceStatusFilter
 from app.schemas.word import (
@@ -228,6 +236,7 @@ def test_document_word_candidates_endpoint_and_document_summary(db_session) -> N
         list_document_word_candidates(
             document_id=document.id,
             search=None,
+            word_filter="all",
             status_view=SourceWordStatusView.ALL,
             reference_status=ReferenceStatusFilter.ALL,
             limit=20,
@@ -356,7 +365,7 @@ def test_word_evidence_endpoint_returns_cross_source_evidence(db_session) -> Non
     assert reference_item.source_import_method is not None
 
 
-def test_source_first_reference_status_overrides_legacy_match_fallback(db_session) -> None:
+def test_source_first_reference_status_overrides_direct_internal_match(db_session) -> None:
     source_service = ReferenceSourceService()
     import_service = ReferenceImportService()
     matching_service = ReferenceMatchingService()
@@ -376,16 +385,16 @@ def test_source_first_reference_status_overrides_legacy_match_fallback(db_sessio
         content="հայաստան\n".encode("utf-8"),
     )
 
-    document, page_one, _ = _seed_document(db_session, user_id=PRIMARY_USER_ID, title="Legacy Match Book")
+    document, page_one, _ = _seed_document(db_session, user_id=PRIMARY_USER_ID, title="Direct Match Book")
     _add_occurrence(
         db_session,
         document=document,
         page=page_one,
         token="Հայաստան",
         normalized_token="հայաստան",
-        snippet="Legacy matched evidence",
+        snippet="Direct matched evidence",
     )
-    legacy_run = matching_service.create_run(
+    direct_run = matching_service.create_run(
         db_session,
         user_id=PRIMARY_USER_ID,
         request=ReferenceMatchRunCreateRequest(
@@ -393,7 +402,7 @@ def test_source_first_reference_status_overrides_legacy_match_fallback(db_sessio
             run_scope="all",
         ),
     )
-    matching_service.process_run_in_session(db_session, run_id=legacy_run.id)
+    matching_service.process_run_in_session(db_session, run_id=direct_run.id)
 
     db_session.execute(delete(Occurrence).where(Occurrence.document_id == document.id))
     source_first_run = matching_service.create_run(
@@ -422,6 +431,62 @@ def test_source_first_reference_status_overrides_legacy_match_fallback(db_sessio
     assert response.source.unmatched_entry_count == 1
     assert response.total == 1
     assert response.items[0].normalized_form == "հայաստան"
+
+
+def test_word_search_finds_morphology_lemma_matches(db_session) -> None:
+    workspace = _seed_workspace(db_session)
+    document = workspace["document"]
+    occurrence = db_session.scalars(
+        select(Occurrence).where(
+            Occurrence.document_id == document.id,
+            Occurrence.normalized_token == "բառ",
+        )
+    ).first()
+    assert occurrence is not None
+    db_session.add(
+        MorphologyAnalysis(
+            user_id=str(PRIMARY_USER_ID),
+            occurrence_id=occurrence.id,
+            document_id=document.id,
+            page_id=occurrence.page_id,
+            source_type="imported_book",
+            token_surface=occurrence.token,
+            token_normalized=occurrence.normalized_token,
+            lemma="Գալ",
+            lemma_normalized="գալ",
+            pos="VERB",
+            analyzer_provider="pie",
+            analyzer_model_key="hye",
+            analysis_status=MorphologyAnalysisStatus.COMPLETED,
+        )
+    )
+    db_session.commit()
+
+    response = asyncio.run(
+        search_words(
+            q="գալ",
+            mode=WordSearchMode.NORMALIZED,
+            include_categories=[WordSearchCategory.IMPORTED_BOOKS],
+            limit_per_category=20,
+            current_user=_current_user(),
+            session=db_session,
+            word_search_service=WordSearchService(),
+        )
+    )
+
+    books_group = next(group for group in response.groups if group.category is WordSearchCategory.IMPORTED_BOOKS)
+    assert books_group.total >= 1
+    assert any(item.normalized_form == "բառ" and item.matched_form == "Գալ" for item in books_group.items)
+
+    check_response = asyncio.run(
+        check_word(
+            q="գալ",
+            current_user=_current_user(),
+            session=db_session,
+            word_search_service=WordSearchService(),
+        )
+    )
+    assert check_response.found_in_imported_books is True
 
 
 def test_global_word_search_and_quick_check(db_session) -> None:

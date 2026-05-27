@@ -10,7 +10,10 @@ from sqlalchemy.orm import joinedload
 from app.core.database import session_scope
 from app.db.models import Document, DocumentPage, DocumentStatus, IngestionJob, IngestionJobStatus, JobKind, Occurrence
 from app.services.ingestion_error_service import IngestionErrorService, get_ingestion_error_service
+from app.services.job_orchestrator import get_job_orchestrator
 from app.services.job_progress_service import JobProgressService, get_job_progress_service
+from app.services.lexicon_group_index_service import get_lexicon_group_index_service
+from app.schemas.morphology import MorphologyRunCreateRequest
 from app.services.occurrence_service import OccurrenceService, get_occurrence_service
 from app.services.page_extraction_service import PageExtractionService, get_page_extraction_service
 from app.services.storage_service import StorageService, get_storage_service
@@ -41,6 +44,8 @@ class IngestionService:
         page_iterator = None
         page_count = 0
 
+        index_service = get_lexicon_group_index_service()
+
         try:
             with session_scope() as session:
                 job = self._load_job(session, job_uuid)
@@ -61,6 +66,13 @@ class IngestionService:
                 job.items_total = None
 
                 document.status = DocumentStatus.PROCESSING
+                from app.services.document_workflow_service import get_document_workflow_service
+
+                get_document_workflow_service().sync_for_document(
+                    session,
+                    document_id=document.id,
+                    last_job_id=job.id,
+                )
 
                 self.job_progress_service.set_stage(
                     session,
@@ -81,13 +93,18 @@ class IngestionService:
                     session,
                     job_kind=JobKind.INGESTION,
                     job=job,
-                    stage_code="opening_document",
+                    stage_code="extracting_pages",
                     progress_percent=10,
                 )
 
             with session_scope() as session:
                 job = self._load_job(session, job_uuid)
                 document = job.document
+                index_service.clear_document_index(
+                    session,
+                    user_id=document.user_id,
+                    document_id=document.id,
+                )
                 session.execute(delete(Occurrence).where(Occurrence.document_id == document.id))
                 session.execute(delete(DocumentPage).where(DocumentPage.document_id == document.id))
 
@@ -96,7 +113,7 @@ class IngestionService:
                     session,
                     job_kind=JobKind.INGESTION,
                     job=job,
-                    stage_code="opening_document",
+                    stage_code="extracting_pages",
                     progress_percent=10,
                     append_event=False,
                 )
@@ -123,7 +140,7 @@ class IngestionService:
                     job = self._load_job(session, job_uuid)
                     document = job.document
                     extraction_stage = (
-                        "running_ocr"
+                        "ocr_processing"
                         if extracted_page.extraction_method.value == "ocr"
                         else "extracting_text"
                     )
@@ -205,7 +222,7 @@ class IngestionService:
                         session,
                         job_kind=JobKind.INGESTION,
                         job=job,
-                        stage_code="tokenizing",
+                        stage_code="storing_occurrences",
                         progress_percent=self.job_progress_service.ranged_progress(
                             processed_pages + 1,
                             page_count,
@@ -216,12 +233,20 @@ class IngestionService:
                         items_total=page_count,
                         append_event=False,
                     )
-                    self.occurrence_service.store_page_occurrences(
+                    occurrences = self.occurrence_service.store_page_occurrences(
                         session,
                         document_id=document.id,
                         page_id=page.id,
                         page_number=page.page_number,
                         text=page.reconstructed_text or page.extracted_text,
+                    )
+                    index_service.apply_page_occurrences(
+                        session,
+                        user_id=document.user_id,
+                        document_id=document.id,
+                        document_title=document.title,
+                        page_id=page.id,
+                        occurrences=occurrences,
                     )
 
                     processed_pages += 1
@@ -273,12 +298,73 @@ class IngestionService:
                     session,
                     job_kind=JobKind.INGESTION,
                     job=job,
+                    stage_code="ready",
                 )
+                from app.services.document_workflow_service import get_document_workflow_service
 
+                get_document_workflow_service().sync_for_document(
+                    session,
+                    document_id=document.id,
+                    last_job_id=job.id,
+                )
+                completed_user_id = document.user_id
+                completed_document_id = document.id
+
+            self._start_post_ingestion_workflow(user_id=completed_user_id, document_id=completed_document_id)
         except Exception as exc:
             logger.exception("Document ingestion failed for job %s", job_uuid)
             self._mark_failed(job_uuid, exc)
             raise
+
+    def _start_post_ingestion_workflow(self, *, user_id: UUID, document_id: UUID) -> None:
+        self._start_document_morphology(user_id=user_id, document_id=document_id)
+        self._start_document_discovery(user_id=user_id, document_id=document_id)
+
+    def _start_document_morphology(self, *, user_id: UUID, document_id: UUID) -> None:
+        from app.services.morphology.morphology_service import get_morphology_service
+
+        try:
+            with session_scope() as session:
+                document = session.get(Document, document_id)
+                if document is None:
+                    return
+                if not self._document_requests_morphology(document):
+                    return
+                run = get_morphology_service().create_run(
+                    session,
+                    user_id=user_id,
+                    request=MorphologyRunCreateRequest(document_id=document_id, analyzer="pie"),
+                )
+                get_job_orchestrator().enqueue(JobKind.MORPHOLOGY, run.id)
+        except Exception:
+            logger.exception(
+                "Failed to start automatic morphology run user_id=%s document_id=%s",
+                user_id,
+                document_id,
+            )
+
+    def _start_document_discovery(self, *, user_id: UUID, document_id: UUID) -> None:
+        from app.services.discovery.discovery_candidate_service import get_discovery_candidate_service
+
+        try:
+            with session_scope() as session:
+                get_discovery_candidate_service().start_build_run(
+                    session,
+                    user_id=user_id,
+                    document_id=document_id,
+                )
+        except Exception:
+            logger.exception(
+                "Failed to start automatic discovery build user_id=%s document_id=%s",
+                user_id,
+                document_id,
+            )
+
+    @staticmethod
+    def _document_requests_morphology(document: Document) -> bool:
+        profile = (document.morphology_profile or "").strip().lower()
+        stage = (document.language_stage or "").strip().lower()
+        return bool(profile) or stage == "classical"
 
     def _mark_failed(self, job_id: UUID, exc: Exception) -> None:
         failure_info = self.ingestion_error_service.map_exception(exc)
@@ -307,6 +393,13 @@ class IngestionService:
             )
             if job.document is not None:
                 job.document.status = DocumentStatus.FAILED
+                from app.services.document_workflow_service import get_document_workflow_service
+
+                get_document_workflow_service().sync_for_document(
+                    session,
+                    document_id=job.document.id,
+                    last_job_id=job.id,
+                )
 
     @staticmethod
     def _load_job(session, job_id: UUID) -> IngestionJob:

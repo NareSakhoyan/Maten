@@ -5,6 +5,7 @@ from pathlib import Path
 import sys
 
 from alembic import context
+import sqlalchemy as sa
 from sqlalchemy import engine_from_config, pool
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -50,6 +51,8 @@ def run_migrations_online() -> None:
         context.configure(connection=connection, target_metadata=target_metadata, compare_type=True)
 
         with context.begin_transaction():
+            # Supabase pooler enforces a short statement timeout; migrations need longer for DDL.
+            connection.execute(sa.text("SET LOCAL statement_timeout = '0'"))
             context.run_migrations()
 
 

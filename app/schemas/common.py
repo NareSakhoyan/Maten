@@ -22,6 +22,23 @@ class HealthResponse(BaseModel):
     status: str
 
 
+class CurrentUserProfile(APIModel):
+    id: UUID
+    email: str | None = None
+    role: str
+
+
+class HealthComponentStatus(APIModel):
+    status: str
+    detail: str | None = None
+
+
+class ReadinessResponse(APIModel):
+    status: str
+    database: HealthComponentStatus
+    redis: HealthComponentStatus
+
+
 class JobProgressState(APIModel):
     current_stage_code: str | None = None
     current_stage_label: str | None = None

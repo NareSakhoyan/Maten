@@ -8,6 +8,8 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.db.models import JobKind, JobStageEvent
+from app.schemas.common import JobStageEventRead
+from app.services.job_progress_notifier import publish_job_progress
 
 
 @dataclass(frozen=True, slots=True)
@@ -20,14 +22,19 @@ class StageDefinition:
 STAGE_REGISTRIES: dict[JobKind, dict[str, StageDefinition]] = {
     JobKind.INGESTION: {
         "queued": StageDefinition("Queued", "Your document is waiting to be processed.", 0),
+        "uploaded": StageDefinition("Uploaded", "Your document has been stored and is waiting for processing.", 0),
         "loading_source_file": StageDefinition("Preparing file", "Loading your document for processing.", 5),
         "opening_document": StageDefinition("Opening document", "Reading the document structure and pages.", 10),
+        "extracting_pages": StageDefinition("Extracting pages", "Reading the document structure and pages.", 10),
         "extracting_text": StageDefinition("Extracting text", "Using embedded text where available.", 25),
         "running_ocr": StageDefinition("Running OCR", "Reading scanned pages as text.", 45),
+        "ocr_processing": StageDefinition("Running OCR", "Reading scanned pages as text.", 45),
         "reconstructing_text": StageDefinition("Reconstructing words", "Joining words that were split across lines.", 75),
         "tokenizing": StageDefinition("Building occurrences", "Collecting word occurrences with page and context.", 85),
+        "storing_occurrences": StageDefinition("Storing occurrences", "Saving word occurrences with page and context.", 85),
         "saving_results": StageDefinition("Saving results", "Saving processed content for review.", 92),
         "finalizing": StageDefinition("Finalizing", "Preparing the document for the next step.", 97),
+        "ready": StageDefinition("Ready", "Processing is complete.", 100),
         "completed": StageDefinition("Completed", "Processing is complete.", 100),
     },
     JobKind.REFERENCE_IMPORT: {
@@ -54,6 +61,49 @@ STAGE_REGISTRIES: dict[JobKind, dict[str, StageDefinition]] = {
         "saving_results": StageDefinition("Saving results", "Saving source-entry results for review.", 90),
         "finalizing": StageDefinition("Finalizing", "Preparing the run results for display.", 97),
         "completed": StageDefinition("Completed", "Reference matching is complete.", 100),
+    },
+    JobKind.NAYIRI_TRUSTED_LOOKUP: {
+        "queued": StageDefinition("Queued", "Your trusted reference check is waiting to start.", 0),
+        "evidence_pending": StageDefinition("Evidence pending", "Evidence lookup is waiting to start.", 0),
+        "loading_words": StageDefinition("Loading words", "Collecting document words for trusted reference lookup.", 5),
+        "evidence_running": StageDefinition("Evidence running", "Checking cached and trusted evidence.", 55),
+        "checking_nayiri": StageDefinition(
+            "Checking trusted references",
+            "Looking up document words in trusted references using cached results when available.",
+            55,
+        ),
+        "finalizing": StageDefinition("Finalizing", "Preparing trusted reference lookup results for review.", 97),
+        "evidence_done": StageDefinition("Evidence done", "Trusted reference lookup is complete.", 100),
+        "completed": StageDefinition("Completed", "Trusted reference lookup is complete.", 100),
+    },
+    JobKind.DISCOVERY_BUILD: {
+        "queued": StageDefinition("Queued", "Your discovery build is waiting to start.", 0),
+        "discovery_pending": StageDefinition("Discovery pending", "Your discovery build is waiting to start.", 0),
+        "loading_occurrences": StageDefinition("Loading occurrences", "Collecting document word forms.", 5),
+        "discovery_running": StageDefinition("Discovery running", "Building and resolving discovery candidates.", 35),
+        "grouping_forms": StageDefinition("Grouping forms", "Grouping words by normalized form.", 20),
+        "collecting_evidence": StageDefinition("Collecting evidence", "Checking local and cached evidence.", 45),
+        "resolving_candidates": StageDefinition("Resolving candidates", "Ranking discovery candidates.", 70),
+        "saving_candidates": StageDefinition("Saving candidates", "Saving the discovery queue.", 90),
+        "building_candidates": StageDefinition("Building candidates", "Building the discovery queue.", 35),
+        "discovery_done": StageDefinition("Discovery done", "Discovery queue is ready.", 100),
+        "completed": StageDefinition("Completed", "Discovery queue is ready.", 100),
+    },
+    JobKind.MORPHOLOGY: {
+        "queued": StageDefinition("Queued", "Your morphology run is waiting to start.", 0),
+        "morphology_pending": StageDefinition("Morphology pending", "Your morphology run is waiting to start.", 0),
+        "loading_scope": StageDefinition("Loading scope", "Collecting tokens from the selected source.", 5),
+        "checking_eligibility": StageDefinition(
+            "Checking eligibility",
+            "Checking whether the selected source can use the Classical Armenian PIE model.",
+            15,
+        ),
+        "running_pie": StageDefinition("Running PIE", "Analyzing eligible tokens with the PIE model.", 55),
+        "morphology_running": StageDefinition("Morphology running", "Analyzing eligible tokens with the PIE model.", 55),
+        "saving_results": StageDefinition("Saving results", "Saving morphology results for review.", 90),
+        "finalizing": StageDefinition("Finalizing", "Preparing the morphology results for use.", 97),
+        "morphology_done": StageDefinition("Morphology done", "Morphology analysis is complete.", 100),
+        "completed": StageDefinition("Completed", "Morphology analysis is complete.", 100),
     },
 }
 
@@ -164,6 +214,7 @@ class JobProgressService:
         )
         if hasattr(job, "finished_at"):
             setattr(job, "finished_at", datetime.now(timezone.utc))
+        publish_job_progress(str(getattr(job, "id")), {"type": "job_refresh"}, user_id=str(getattr(job, "user_id")))
 
     def fail(
         self,
@@ -187,6 +238,7 @@ class JobProgressService:
             items_total=getattr(job, "items_total", None),
             force=True,
         )
+        publish_job_progress(str(getattr(job, "id")), {"type": "job_refresh"}, user_id=str(getattr(job, "user_id")))
 
     def append_event(
         self,
@@ -224,21 +276,28 @@ class JobProgressService:
             ):
                 return
 
-        session.add(
-            JobStageEvent(
-                job_kind=job_kind,
-                job_id=job_id,
-                user_id=user_id,
-                stage_code=stage_code,
-                stage_label=stage_label,
-                message_user=message_user,
-                progress_percent=progress_percent,
-                items_processed=items_processed,
-                items_total=items_total,
-                created_at=datetime.now(timezone.utc),
-            )
+        event = JobStageEvent(
+            job_kind=job_kind,
+            job_id=job_id,
+            user_id=user_id,
+            stage_code=stage_code,
+            stage_label=stage_label,
+            message_user=message_user,
+            progress_percent=progress_percent,
+            items_processed=items_processed,
+            items_total=items_total,
+            created_at=datetime.now(timezone.utc),
         )
+        session.add(event)
         session.flush()
+        publish_job_progress(
+            job_id,
+            {
+                "type": "event",
+                "event": JobStageEventRead.model_validate(event).model_dump(mode="json"),
+            },
+            user_id=user_id,
+        )
 
     def list_events(
         self,

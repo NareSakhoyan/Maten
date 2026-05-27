@@ -5,9 +5,9 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
-from app.api.deps import get_current_user, get_db_session
-from app.core.celery_app import celery_app
+from app.api.deps import get_db_session, require_admin_user
 from app.db.models import JobKind
+from app.services.job_orchestrator import get_job_orchestrator
 from app.schemas.common import JobStageEventListResponse, JobStageEventRead
 from app.schemas.job import LongRunningJobRead
 from app.schemas.reference import (
@@ -24,6 +24,7 @@ from app.schemas.reference import (
     ReferenceStatusFilter,
 )
 from app.services.auth_service import AuthenticatedUser
+from app.services.backpressure_service import BackpressureLimitError, get_backpressure_service
 from app.services.job_progress_service import JobProgressService, get_job_progress_service
 from app.services.long_running_job_service import LongRunningJobService, get_long_running_job_service
 from app.services.reference_matching_service import (
@@ -40,12 +41,13 @@ router = APIRouter(prefix="/reference-matching")
 @router.post("/runs", response_model=ReferenceMatchingStartResponse, status_code=status.HTTP_201_CREATED)
 async def create_reference_matching_run(
     request: ReferenceMatchRunCreateRequest,
-    current_user: AuthenticatedUser = Depends(get_current_user),
+    current_user: AuthenticatedUser = Depends(require_admin_user),
     session: Session = Depends(get_db_session),
     reference_matching_service: ReferenceMatchingService = Depends(get_reference_matching_service),
     long_running_job_service: LongRunningJobService = Depends(get_long_running_job_service),
 ) -> ReferenceMatchingStartResponse:
     try:
+        get_backpressure_service().ensure_user_capacity(session, user_id=current_user.user_id)
         run = reference_matching_service.create_run(
             session,
             user_id=current_user.user_id,
@@ -55,16 +57,17 @@ async def create_reference_matching_run(
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    except BackpressureLimitError as exc:
+        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=str(exc)) from exc
 
     try:
-        celery_app.send_task(
-            "app.workers.tasks.process_reference_matching_run",
-            args=[str(run.id)],
+        get_job_orchestrator().enqueue(
+            JobKind.REFERENCE_MATCHING,
+            run.id,
             kwargs={
                 "view": request.view,
                 "include_fuzzy": request.include_fuzzy,
             },
-            task_id=str(run.id),
         )
     except Exception as exc:
         reference_matching_service.mark_run_failed(
@@ -90,7 +93,7 @@ async def create_reference_matching_run(
 @router.post("/runs/{run_id}/retry", response_model=ReferenceMatchingStartResponse)
 async def retry_reference_matching_run(
     run_id: UUID,
-    current_user: AuthenticatedUser = Depends(get_current_user),
+    current_user: AuthenticatedUser = Depends(require_admin_user),
     session: Session = Depends(get_db_session),
     reference_matching_service: ReferenceMatchingService = Depends(get_reference_matching_service),
     long_running_job_service: LongRunningJobService = Depends(get_long_running_job_service),
@@ -107,14 +110,13 @@ async def retry_reference_matching_run(
         raise HTTPException(status_code=exc.status_code, detail=exc.message) from exc
 
     try:
-        celery_app.send_task(
-            "app.workers.tasks.process_reference_matching_run",
-            args=[str(retry_run.id)],
+        get_job_orchestrator().enqueue(
+            JobKind.REFERENCE_MATCHING,
+            retry_run.id,
             kwargs={
                 "view": retry_run.requested_view,
                 "include_fuzzy": retry_run.include_fuzzy,
             },
-            task_id=str(retry_run.id),
         )
     except Exception as exc:
         reference_matching_service.mark_run_failed(
@@ -141,7 +143,7 @@ async def retry_reference_matching_run(
 async def list_reference_matching_runs(
     limit: int = Query(default=20, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
-    current_user: AuthenticatedUser = Depends(get_current_user),
+    current_user: AuthenticatedUser = Depends(require_admin_user),
     session: Session = Depends(get_db_session),
     reference_matching_service: ReferenceMatchingService = Depends(get_reference_matching_service),
 ) -> ReferenceMatchRunListResponse:
@@ -160,7 +162,7 @@ async def list_reference_matching_runs(
 @router.get("/runs/{run_id}", response_model=ReferenceMatchRunDetail)
 async def get_reference_matching_run(
     run_id: UUID,
-    current_user: AuthenticatedUser = Depends(get_current_user),
+    current_user: AuthenticatedUser = Depends(require_admin_user),
     session: Session = Depends(get_db_session),
     reference_matching_service: ReferenceMatchingService = Depends(get_reference_matching_service),
 ) -> ReferenceMatchRunDetail:
@@ -187,7 +189,7 @@ async def list_reference_matching_run_results(
     search: str | None = Query(default=None),
     limit: int = Query(default=20, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
-    current_user: AuthenticatedUser = Depends(get_current_user),
+    current_user: AuthenticatedUser = Depends(require_admin_user),
     session: Session = Depends(get_db_session),
     reference_matching_service: ReferenceMatchingService = Depends(get_reference_matching_service),
 ) -> ReferenceMatchRunEntryResultListResponse:
@@ -218,7 +220,7 @@ async def list_reference_matching_run_results(
 async def get_reference_matching_run_result(
     run_id: UUID,
     result_id: UUID,
-    current_user: AuthenticatedUser = Depends(get_current_user),
+    current_user: AuthenticatedUser = Depends(require_admin_user),
     session: Session = Depends(get_db_session),
     reference_matching_service: ReferenceMatchingService = Depends(get_reference_matching_service),
 ) -> ReferenceMatchRunEntryResultDetail:
@@ -253,7 +255,7 @@ async def list_reference_matching_run_target_results(
     search: str | None = Query(default=None),
     limit: int = Query(default=20, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
-    current_user: AuthenticatedUser = Depends(get_current_user),
+    current_user: AuthenticatedUser = Depends(require_admin_user),
     session: Session = Depends(get_db_session),
     reference_matching_service: ReferenceMatchingService = Depends(get_reference_matching_service),
 ) -> ReferenceMatchRunResultListResponse:
@@ -284,7 +286,7 @@ async def list_reference_matching_run_target_results(
 async def get_reference_matching_run_target_result(
     run_id: UUID,
     result_id: UUID,
-    current_user: AuthenticatedUser = Depends(get_current_user),
+    current_user: AuthenticatedUser = Depends(require_admin_user),
     session: Session = Depends(get_db_session),
     reference_matching_service: ReferenceMatchingService = Depends(get_reference_matching_service),
 ) -> ReferenceMatchRunResultDetail:
@@ -307,7 +309,7 @@ async def list_reference_matching_run_events(
     run_id: UUID,
     limit: int = Query(default=100, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
-    current_user: AuthenticatedUser = Depends(get_current_user),
+    current_user: AuthenticatedUser = Depends(require_admin_user),
     session: Session = Depends(get_db_session),
     reference_matching_service: ReferenceMatchingService = Depends(get_reference_matching_service),
     job_progress_service: JobProgressService = Depends(get_job_progress_service),

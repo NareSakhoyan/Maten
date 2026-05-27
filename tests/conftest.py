@@ -15,7 +15,7 @@ os.environ.setdefault("SUPABASE_URL", "https://example.supabase.co")
 os.environ.setdefault("SUPABASE_SERVICE_ROLE_KEY", "service-role-key")
 os.environ.setdefault("CELERY_BROKER_URL", "redis://localhost:6379/0")
 os.environ.setdefault("CELERY_RESULT_BACKEND", "redis://localhost:6379/1")
-from app.db.models import Base
+from app.db.models import Base, Document
 
 
 PRIMARY_USER_ID = UUID("123e4567-e89b-12d3-a456-426614174000")
@@ -40,6 +40,24 @@ def db_engine() -> Engine:
 @pytest.fixture()
 def session_factory(db_engine: Engine):
     return sessionmaker(bind=db_engine, autoflush=False, autocommit=False, expire_on_commit=False)
+
+
+def rebuild_lexicon_index_for_document(
+    session: Session,
+    *,
+    user_id: UUID,
+    document: Document,
+) -> None:
+    """Mirror production: lexicon list/workflow read from index, not raw occurrences."""
+    from app.services.lexicon_group_index_service import LexiconGroupIndexService
+
+    LexiconGroupIndexService().rebuild_document(
+        session,
+        user_id=user_id,
+        document_id=document.id,
+        document_title=document.title,
+    )
+    session.commit()
 
 
 @pytest.fixture()

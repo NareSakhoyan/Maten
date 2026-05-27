@@ -5,10 +5,12 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
 from sqlalchemy.orm import Session
 
-from app.api.deps import get_current_user, get_db_session
-from app.core.celery_app import celery_app
+from app.api.deps import get_db_session, require_admin_user
+from app.api.routers.morphology import start_morphology_run_or_raise
 from app.db.models import JobKind, ReferenceImportStatus
+from app.services.job_orchestrator import get_job_orchestrator
 from app.schemas.common import JobStageEventListResponse, JobStageEventRead
+from app.schemas.morphology import MorphologyRunCreateRequest, MorphologySettingsUpdateRequest, ReferenceSourceMorphologySettingsResponse
 from app.schemas.reference import (
     ReferenceImportListResponse,
     ReferenceImportResponse,
@@ -23,6 +25,7 @@ from app.schemas.word import ReferenceSourceWordCandidateListResponse, Reference
 from app.services.auth_service import AuthenticatedUser
 from app.services.job_progress_service import JobProgressService, get_job_progress_service
 from app.services.long_running_job_service import LongRunningJobService, get_long_running_job_service
+from app.services.morphology.morphology_service import MorphologyService, get_morphology_service
 from app.services.reference_import_service import ReferenceImportService, get_reference_import_service
 from app.services.reference_source_service import (
     ReferenceSourceSchemaNotReadyError,
@@ -40,7 +43,7 @@ router = APIRouter(prefix="/reference-sources")
 @router.post("", response_model=ReferenceSourceDetail, status_code=status.HTTP_201_CREATED)
 async def create_reference_source(
     request: ReferenceSourceCreateRequest,
-    current_user: AuthenticatedUser = Depends(get_current_user),
+    current_user: AuthenticatedUser = Depends(require_admin_user),
     session: Session = Depends(get_db_session),
     reference_source_service: ReferenceSourceService = Depends(get_reference_source_service),
 ) -> ReferenceSourceDetail:
@@ -58,7 +61,7 @@ async def create_reference_source(
 
 @router.get("", response_model=list[ReferenceSourceSummary])
 async def list_reference_sources(
-    current_user: AuthenticatedUser = Depends(get_current_user),
+    current_user: AuthenticatedUser = Depends(require_admin_user),
     session: Session = Depends(get_db_session),
     reference_source_service: ReferenceSourceService = Depends(get_reference_source_service),
 ) -> list[ReferenceSourceSummary]:
@@ -71,7 +74,7 @@ async def list_reference_sources(
 @router.get("/{source_id}", response_model=ReferenceSourceDetail)
 async def get_reference_source(
     source_id: UUID,
-    current_user: AuthenticatedUser = Depends(get_current_user),
+    current_user: AuthenticatedUser = Depends(require_admin_user),
     session: Session = Depends(get_db_session),
     reference_source_service: ReferenceSourceService = Depends(get_reference_source_service),
 ) -> ReferenceSourceDetail:
@@ -88,11 +91,55 @@ async def get_reference_source(
     return source
 
 
+@router.patch("/{source_id}/morphology-settings", response_model=ReferenceSourceMorphologySettingsResponse)
+async def update_reference_source_morphology_settings(
+    source_id: UUID,
+    request: MorphologySettingsUpdateRequest,
+    current_user: AuthenticatedUser = Depends(require_admin_user),
+    session: Session = Depends(get_db_session),
+    reference_source_service: ReferenceSourceService = Depends(get_reference_source_service),
+    morphology_service: MorphologyService = Depends(get_morphology_service),
+    long_running_job_service: LongRunningJobService = Depends(get_long_running_job_service),
+) -> ReferenceSourceMorphologySettingsResponse:
+    try:
+        source = reference_source_service.update_morphology_settings(
+            session,
+            user_id=current_user.user_id,
+            source_id=source_id,
+            language_stage=request.language_stage,
+            morphology_profile=request.morphology_profile,
+        )
+    except ReferenceSourceSchemaNotReadyError as exc:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+
+    run_response = None
+    if request.run_morphology:
+        run_response = start_morphology_run_or_raise(
+            session=session,
+            current_user=current_user,
+            request=MorphologyRunCreateRequest(
+                reference_source_id=source_id,
+                analyzer=request.analyzer,
+            ),
+            morphology_service=morphology_service,
+            long_running_job_service=long_running_job_service,
+        )
+
+    return ReferenceSourceMorphologySettingsResponse(
+        message="Reference source morphology settings updated",
+        source=source,
+        run=run_response.run if run_response is not None else None,
+        job=run_response.job if run_response is not None else None,
+    )
+
+
 @router.post("/{source_id}/import", response_model=ReferenceImportStartResponse)
 async def import_reference_source_entries(
     source_id: UUID,
     file: UploadFile = File(...),
-    current_user: AuthenticatedUser = Depends(get_current_user),
+    current_user: AuthenticatedUser = Depends(require_admin_user),
     session: Session = Depends(get_db_session),
     reference_source_service: ReferenceSourceService = Depends(get_reference_source_service),
     reference_import_service: ReferenceImportService = Depends(get_reference_import_service),
@@ -139,11 +186,7 @@ async def import_reference_source_entries(
         if refreshed_source is None:
             raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Reference source not found.")
         try:
-            celery_app.send_task(
-                "app.workers.tasks.process_reference_source_import",
-                args=[str(import_run.id)],
-                task_id=str(import_run.id),
-            )
+            get_job_orchestrator().enqueue(JobKind.REFERENCE_IMPORT, import_run.id)
         except Exception as exc:
             import_run.status = ReferenceImportStatus.FAILED
             import_run.error_code = "reference_import_enqueue_failed"
@@ -175,7 +218,7 @@ async def list_reference_source_imports(
     source_id: UUID,
     limit: int = Query(default=20, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
-    current_user: AuthenticatedUser = Depends(get_current_user),
+    current_user: AuthenticatedUser = Depends(require_admin_user),
     session: Session = Depends(get_db_session),
     reference_source_service: ReferenceSourceService = Depends(get_reference_source_service),
     reference_import_service: ReferenceImportService = Depends(get_reference_import_service),
@@ -204,7 +247,7 @@ async def list_reference_source_imports(
 async def get_reference_source_import(
     source_id: UUID,
     import_id: UUID,
-    current_user: AuthenticatedUser = Depends(get_current_user),
+    current_user: AuthenticatedUser = Depends(require_admin_user),
     session: Session = Depends(get_db_session),
     reference_source_service: ReferenceSourceService = Depends(get_reference_source_service),
     reference_import_service: ReferenceImportService = Depends(get_reference_import_service),
@@ -234,7 +277,7 @@ async def get_reference_source_import(
 async def retry_reference_source_import(
     source_id: UUID,
     import_id: UUID,
-    current_user: AuthenticatedUser = Depends(get_current_user),
+    current_user: AuthenticatedUser = Depends(require_admin_user),
     session: Session = Depends(get_db_session),
     reference_source_service: ReferenceSourceService = Depends(get_reference_source_service),
     reference_import_service: ReferenceImportService = Depends(get_reference_import_service),
@@ -262,11 +305,7 @@ async def retry_reference_source_import(
         raise HTTPException(status_code=exc.status_code, detail=exc.message) from exc
 
     try:
-        celery_app.send_task(
-            "app.workers.tasks.process_reference_source_import",
-            args=[str(retry_import.id)],
-            task_id=str(retry_import.id),
-        )
+        get_job_orchestrator().enqueue(JobKind.REFERENCE_IMPORT, retry_import.id)
     except Exception as exc:
         retry_import.status = ReferenceImportStatus.FAILED
         retry_import.error_code = "reference_import_enqueue_failed"
@@ -304,7 +343,7 @@ async def list_reference_source_import_events(
     import_id: UUID,
     limit: int = Query(default=100, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
-    current_user: AuthenticatedUser = Depends(get_current_user),
+    current_user: AuthenticatedUser = Depends(require_admin_user),
     session: Session = Depends(get_db_session),
     reference_source_service: ReferenceSourceService = Depends(get_reference_source_service),
     reference_import_service: ReferenceImportService = Depends(get_reference_import_service),
@@ -350,7 +389,7 @@ async def list_reference_source_word_candidates(
     reference_status: ReferenceStatusFilter = Query(default=ReferenceStatusFilter.ALL),
     limit: int = Query(default=20, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
-    current_user: AuthenticatedUser = Depends(get_current_user),
+    current_user: AuthenticatedUser = Depends(require_admin_user),
     session: Session = Depends(get_db_session),
     reference_source_service: ReferenceSourceService = Depends(get_reference_source_service),
     source_word_review_service: SourceWordReviewService = Depends(get_source_word_review_service),
@@ -407,7 +446,7 @@ async def list_reference_source_entries(
     match_status: ReferenceStatusFilter = Query(default=ReferenceStatusFilter.ALL),
     limit: int = Query(default=20, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
-    current_user: AuthenticatedUser = Depends(get_current_user),
+    current_user: AuthenticatedUser = Depends(require_admin_user),
     session: Session = Depends(get_db_session),
     reference_source_service: ReferenceSourceService = Depends(get_reference_source_service),
     reference_matching_service: ReferenceMatchingService = Depends(get_reference_matching_service),

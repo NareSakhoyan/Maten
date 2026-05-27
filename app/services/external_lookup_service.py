@@ -78,9 +78,6 @@ class ExternalLookupService:
         if not normalized_query:
             raise ValueError("q must not be empty.")
 
-        if not self.settings.external_lookup_enabled:
-            return ExternalLookupBatch(items=[], status=TrustedExternalLookupStatus.UNAVAILABLE)
-
         providers = self._resolve_provider_rows(session, provider_keys=provider_keys)
         if not providers:
             return ExternalLookupBatch(items=[], status=TrustedExternalLookupStatus.UNAVAILABLE)
@@ -98,16 +95,19 @@ class ExternalLookupService:
             if cached is not None and self._cache_is_fresh(cached):
                 batch = self._batch_from_cache(cached, provider_row=provider_row)
             else:
-                provider = self.providers[provider_row.key]
-                batch = self._fetch_and_cache(
-                    session,
-                    provider_row=provider_row,
-                    provider=provider,
-                    query_text=query.strip(),
-                    normalized_query=normalized_query,
-                    mode=mode,
-                    user_id=user_id,
-                )
+                provider = self.providers.get(provider_row.key)
+                if provider is None or not self.settings.external_lookup_enabled:
+                    batch = ExternalLookupBatch(items=[], status=TrustedExternalLookupStatus.UNAVAILABLE)
+                else:
+                    batch = self._fetch_and_cache(
+                        session,
+                        provider_row=provider_row,
+                        provider=provider,
+                        query_text=query.strip(),
+                        normalized_query=normalized_query,
+                        mode=mode,
+                        user_id=user_id,
+                    )
             provider_statuses.append(batch.status)
             items.extend(batch.items)
 
@@ -133,6 +133,62 @@ class ExternalLookupService:
             status=self._aggregate_status(provider_statuses, items=list(deduped_items.values())),
         )
 
+    def lookup_cached(
+        self,
+        session: Session,
+        *,
+        query: str,
+        mode: WordSearchMode,
+        provider_keys: list[str] | None = None,
+    ) -> ExternalLookupBatch:
+        """Return trusted external evidence from the persistent cache without network I/O."""
+        normalized_query = normalize_token(query)
+        if not normalized_query:
+            raise ValueError("q must not be empty.")
+
+        providers = self._resolve_existing_provider_rows(session, provider_keys=provider_keys)
+        if not providers:
+            return ExternalLookupBatch(items=[], status=TrustedExternalLookupStatus.UNAVAILABLE)
+
+        items: list[ExternalEvidenceItem] = []
+        statuses: list[TrustedExternalLookupStatus] = []
+        search_mode = self._search_mode(mode)
+        for provider_row in providers:
+            cached = self._latest_cache(
+                session,
+                provider_id=provider_row.id,
+                normalized_query=normalized_query,
+                search_mode=search_mode,
+            )
+            if cached is None or not self._cache_is_fresh(cached):
+                statuses.append(TrustedExternalLookupStatus.UNAVAILABLE)
+                continue
+            batch = self._batch_from_cache(cached, provider_row=provider_row)
+            statuses.append(batch.status)
+            items.extend(batch.items)
+
+        deduped_items = {
+            (
+                item.provider_key,
+                item.matched_form,
+                item.reference_link or "",
+                item.source_title or "",
+            ): item
+            for item in items
+        }
+        return ExternalLookupBatch(
+            items=sorted(
+                deduped_items.values(),
+                key=lambda item: (
+                    item.provider_display_name,
+                    item.source_title or "",
+                    item.matched_form,
+                    item.reference_link or "",
+                ),
+            ),
+            status=self._aggregate_status(statuses, items=list(deduped_items.values())),
+        )
+
     def _resolve_provider_rows(
         self,
         session: Session,
@@ -143,33 +199,61 @@ class ExternalLookupService:
         unknown_keys = [key for key in requested_keys if key not in self._known_provider_keys]
         if unknown_keys:
             raise ValueError(f"Unknown trusted external provider keys: {', '.join(sorted(unknown_keys))}.")
-
-        active_requested_keys = [key for key in requested_keys if key in self.providers]
-        if not active_requested_keys:
+        if not requested_keys:
             return []
 
         existing_rows = {
             row.key: row
             for row in session.scalars(
-                select(ExternalProvider).where(ExternalProvider.key.in_(active_requested_keys))
+                select(ExternalProvider).where(ExternalProvider.key.in_(requested_keys))
             )
         }
-        for key in active_requested_keys:
-            provider = self.providers[key]
+        resolved_rows: list[ExternalProvider] = []
+        for key in requested_keys:
+            provider = self.providers.get(key)
             row = existing_rows.get(key)
-            if row is None:
-                row = ExternalProvider(
-                    key=provider.provider_key(),
-                    display_name=provider.provider_display_name(),
-                    is_active=True,
-                )
-                session.add(row)
-                session.flush()
-                existing_rows[key] = row
+            if provider is not None:
+                if row is None:
+                    row = ExternalProvider(
+                        key=provider.provider_key(),
+                        display_name=provider.provider_display_name(),
+                        is_active=True,
+                    )
+                    session.add(row)
+                    session.flush()
+                    existing_rows[key] = row
+                elif row.display_name != provider.provider_display_name():
+                    row.display_name = provider.provider_display_name()
+                if row.is_active:
+                    resolved_rows.append(row)
                 continue
-            if row.display_name != provider.provider_display_name():
-                row.display_name = provider.provider_display_name()
-        return [existing_rows[key] for key in active_requested_keys if existing_rows[key].is_active]
+
+            if row is not None and row.is_active:
+                resolved_rows.append(row)
+        return resolved_rows
+
+    def _resolve_existing_provider_rows(
+        self,
+        session: Session,
+        *,
+        provider_keys: list[str] | None,
+    ) -> list[ExternalProvider]:
+        requested_keys = list(dict.fromkeys(provider_keys or self._known_provider_keys))
+        unknown_keys = [key for key in requested_keys if key not in self._known_provider_keys]
+        if unknown_keys:
+            raise ValueError(f"Unknown trusted external provider keys: {', '.join(sorted(unknown_keys))}.")
+        if not requested_keys:
+            return []
+        return list(
+            session.scalars(
+                select(ExternalProvider)
+                .where(
+                    ExternalProvider.key.in_(requested_keys),
+                    ExternalProvider.is_active.is_(True),
+                )
+                .order_by(ExternalProvider.display_name.asc(), ExternalProvider.key.asc())
+            )
+        )
 
     @staticmethod
     def _default_providers(settings: Settings) -> list[ExternalLookupProvider]:

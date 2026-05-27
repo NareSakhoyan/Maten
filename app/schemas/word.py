@@ -42,6 +42,20 @@ class TrustedExternalLookupStatus(str, enum.Enum):
     UNAVAILABLE = "unavailable"
 
 
+class DocumentTrustedExternalStatus(str, enum.Enum):
+    FOUND = "found"
+    NOT_FOUND = "not_found"
+    UNCHECKED = "unchecked"
+    UNAVAILABLE = "unavailable"
+
+
+class DocumentTrustedExternalCanonicalizationStatus(str, enum.Enum):
+    DIRECT_MATCH = "direct_match"
+    CANONICALIZED_BY_NAYIRI = "canonicalized_by_nayiri"
+    MORPHOLOGY_ASSISTED = "morphology_assisted"
+    UNRESOLVED = "unresolved"
+
+
 class SourceWordStatusView(str, enum.Enum):
     ALL = "all"
     LINKED = "linked"
@@ -78,6 +92,9 @@ class WordEvidenceItem(APIModel):
     match_score: float | None = None
     fetched_at: datetime | None = None
     created_at: datetime | None = None
+    source_evidence_role: str | None = None
+    source_evidence_tier: str | None = None
+    source_evidence_verified: bool | None = None
 
 
 class WordSearchResultGroup(APIModel):
@@ -106,6 +123,19 @@ class WordEvidenceSummary(APIModel):
     source_count: int
     linked_lexeme_id: UUID | None = None
     linked_lexeme_canonical_form: str | None = None
+    surface_form: str | None = None
+    normalized_form: str | None = None
+    morphological_lemma: str | None = None
+    morphological_source: str | None = None
+    morphological_standard: str | None = None
+    dictionary_lemma: str | None = None
+    dictionary_lemma_source: str | None = None
+    lexical_mapping_confidence: float | None = None
+    lexical_mapping_conflict_status: str | None = None
+    best_lemma: str | None = None
+    lemma_candidates: list[str] = Field(default_factory=list)
+    pos_candidates: list[str] = Field(default_factory=list)
+    morphology_available: bool = False
 
 
 class WordEvidenceExternalSummary(APIModel):
@@ -114,12 +144,29 @@ class WordEvidenceExternalSummary(APIModel):
     status: TrustedExternalLookupStatus
 
 
+class WordNamedEntityEvidenceItem(APIModel):
+    id: UUID
+    provider_key: str = "pioner_ner"
+    provider_display_name: str
+    entity_surface: str
+    normalized_surface: str
+    entity_type: str
+    source_kind: str
+    dataset_split: str
+    occurrence_count: int
+    confidence: float | None = None
+    validation_strength: str = "suggests_candidate"
+    evidence_role: str = "named_entity_signal"
+    sample_contexts: list[str] = Field(default_factory=list)
+
+
 class WordEvidenceResponse(OffsetPagination):
     normalized_form: str
     summary: WordEvidenceSummary
     evidence_items: list[WordEvidenceItem]
     external_summary: WordEvidenceExternalSummary | None = None
     external_evidence_items: list[WordEvidenceItem] = Field(default_factory=list)
+    named_entity_evidence_items: list[WordNamedEntityEvidenceItem] = Field(default_factory=list)
     related_reference_matches: list[ReferenceMatchBest] | None = None
     related_lexeme_summary: RelatedLexemeSummary | None = None
 
@@ -145,6 +192,30 @@ class DocumentWordCandidateSummary(APIModel):
     has_reference_match: bool = False
     reference_match_count: int = 0
     best_reference_match: ReferenceMatchBest | None = None
+    trusted_external_status: DocumentTrustedExternalStatus = DocumentTrustedExternalStatus.UNCHECKED
+    trusted_external_provider_display_name: str | None = None
+    trusted_external_match_count: int = 0
+    trusted_external_matched_form: str | None = None
+    trusted_external_source_title: str | None = None
+    trusted_external_reference_link: str | None = None
+    trusted_external_snippet: str | None = None
+    trusted_external_canonicalization_status: DocumentTrustedExternalCanonicalizationStatus = (
+        DocumentTrustedExternalCanonicalizationStatus.UNRESOLVED
+    )
+
+
+class DocumentTrustedExternalLookupSummary(APIModel):
+    found_count: int = 0
+    not_found_count: int = 0
+    unchecked_count: int = 0
+    unavailable_count: int = 0
+    total_forms: int = 0
+
+
+class DocumentTrustedExternalLookupRunStartResponse(APIModel):
+    message: str
+    run_id: UUID
+    job_id: UUID
 
 
 class DocumentWordCandidateListResponse(OffsetPagination):
@@ -209,3 +280,17 @@ class WordCheckResponse(APIModel):
     trusted_external_status: TrustedExternalLookupStatus | None = None
     trusted_external_match_count: int = 0
     trusted_external_sources: list[TrustedExternalWordCheckSource] = Field(default_factory=list)
+
+
+class NayiriCorpusMatchRead(APIModel):
+    normalized_query: str
+    canonical_form: str
+    token_count: int
+    source_count: int
+
+
+class NayiriCorpusCheckResponse(APIModel):
+    query: str
+    normalized_query: str
+    found: bool = False
+    matches: list[NayiriCorpusMatchRead] = Field(default_factory=list)

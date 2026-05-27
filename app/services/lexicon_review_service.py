@@ -6,6 +6,7 @@ from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
 from app.db.models import LexiconGroupReview, LexiconGroupReviewStatus
+from app.schemas.lexeme import LexemeMergeGroupsRequest
 from app.utils.text_normalization import normalize_token_list
 
 
@@ -45,6 +46,20 @@ class LexiconReviewService:
             existing_review.review_status = LexiconGroupReviewStatus.IGNORED_NOISE
             existing_review.reviewer_note = reviewer_note
 
+        from app.services.document_workflow_service import get_document_workflow_service
+
+        get_document_workflow_service().sync_for_normalized_forms(
+            session,
+            user_id=user_id,
+            normalized_forms=normalized_values,
+        )
+        from app.services.lexicon_group_index_service import get_lexicon_group_index_service
+
+        get_lexicon_group_index_service().sync_metadata(
+            session,
+            user_id=user_id,
+            normalized_forms=normalized_values,
+        )
         session.commit()
         return normalized_values
 
@@ -56,8 +71,43 @@ class LexiconReviewService:
                 LexiconGroupReview.normalized_form.in_(normalized_values),
             )
         )
+        from app.services.document_workflow_service import get_document_workflow_service
+
+        get_document_workflow_service().sync_for_normalized_forms(
+            session,
+            user_id=user_id,
+            normalized_forms=normalized_values,
+        )
+        from app.services.lexicon_group_index_service import get_lexicon_group_index_service
+
+        get_lexicon_group_index_service().sync_metadata(
+            session,
+            user_id=user_id,
+            normalized_forms=normalized_values,
+        )
         session.commit()
         return normalized_values
+
+    def link_groups_to_lexeme(
+        self,
+        session: Session,
+        *,
+        user_id: UUID,
+        lexeme_id: UUID,
+        normalized_forms: list[str],
+    ) -> tuple[str, list[str]]:
+        from app.services.lexeme_service import get_lexeme_service
+
+        normalized_values = self._normalize_forms(normalized_forms)
+        lexeme = get_lexeme_service().merge_groups(
+            session,
+            user_id=user_id,
+            lexeme_id=lexeme_id,
+            request=LexemeMergeGroupsRequest(normalized_forms=normalized_values),
+        )
+        if lexeme is None:
+            raise ValueError("Lexeme not found.")
+        return lexeme.canonical_form, normalized_values
 
     @staticmethod
     def _normalize_forms(values: list[str]) -> list[str]:

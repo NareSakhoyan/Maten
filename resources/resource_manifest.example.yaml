@@ -1,0 +1,232 @@
+resources:
+  - key: internal_lexicon
+    display_name: "Internal Curated Lexicon"
+    type: lexicon
+    provider_key: internal_lexicon
+    provider_type: curated_lexicon
+    evidence_role: curated_truth
+    language_variant: mixed
+    language_profile: mixed
+    license: internal
+    source_url: null
+    local_path: null
+    version: live
+    enabled: true
+    priority: 1
+    can_validate_word: true
+    can_attest_usage: false
+    can_suggest_lemma: false
+    can_suggest_named_entity: false
+    requires_exact_match: true
+    requires_structured_headword: false
+    default_runtime: local
+    independent_source_group: internal_lexicon
+    source_kind: curated
+    notes: "Human-approved lexemes and forms. Highest trust."
+
+  - key: imported_references
+    display_name: "Imported Reference Sources"
+    type: reference
+    provider_key: imported_references
+    provider_type: imported_dictionary
+    evidence_role: structured_dictionary_headword
+    language_variant: mixed
+    language_profile: mixed
+    license: user-provided
+    source_url: null
+    local_path: null
+    version: user-managed
+    enabled: true
+    priority: 2
+    can_validate_word: true
+    can_attest_usage: false
+    can_suggest_lemma: false
+    can_suggest_named_entity: false
+    requires_exact_match: true
+    requires_structured_headword: true
+    default_runtime: local
+    independent_source_group: imported_references
+    source_kind: dictionary
+    notes: "User-imported dictionaries, glossaries, and academic references."
+
+  - key: calfa_classical_lexical_db
+    display_name: "Calfa Classical Armenian Lexical Database"
+    type: dictionary
+    provider_key: calfa_classical_lexical_db
+    provider_type: dictionary
+    evidence_role: structured_dictionary_headword
+    language_variant: classical
+    language_profile: classical
+    enabled: false
+    priority: 3
+    can_validate_word: true
+    can_attest_usage: false
+    can_suggest_lemma: false
+    can_suggest_named_entity: false
+    requires_exact_match: true
+    requires_structured_headword: true
+    default_runtime: disabled
+    independent_source_group: calfa
+    source_kind: dictionary
+    notes: "Future high-priority source for Classical/Grabar validation if available locally and legally usable."
+
+  - key: pie_classical_morphology
+    display_name: "PIE / DALiH Classical Armenian Morphology"
+    type: morphology_model
+    provider_key: pie_classical_morphology
+    provider_type: morphology
+    evidence_role: lemma_pos_features
+    language_variant: classical
+    language_profile: classical
+    license: see-project-readme
+    source_url: https://github.com/hipster-philology/nlp-pie
+    local_path: ../data/pie/xcl
+    version: xcl
+    enabled: false
+    priority: 10
+    can_validate_word: false
+    can_attest_usage: false
+    can_suggest_lemma: true
+    can_suggest_named_entity: false
+    requires_exact_match: false
+    requires_structured_headword: false
+    default_runtime: local
+    independent_source_group: pie_dalih
+    source_kind: morphology
+    notes: "Lemmatization, POS tagging, morphological features for Classical Armenian."
+
+  - key: pie_eastern_morphology
+    display_name: "PIE / DALiH Eastern Armenian Morphology"
+    type: morphology_model
+    provider_key: pie_eastern_morphology
+    provider_type: morphology
+    evidence_role: lemma_pos_features
+    language_variant: eastern
+    language_profile: eastern
+    license: see-project-readme
+    source_url: https://github.com/hipster-philology/nlp-pie
+    local_path: ../data/pie/eastern
+    version: hye
+    enabled: false
+    priority: 11
+    can_validate_word: false
+    can_attest_usage: false
+    can_suggest_lemma: true
+    can_suggest_named_entity: false
+    requires_exact_match: false
+    requires_structured_headword: false
+    default_runtime: local
+    independent_source_group: pie_dalih
+    source_kind: morphology
+    notes: "Lemmatization, POS tagging, morphological features for Eastern Armenian."
+
+  - key: eanc_eastern_corpus
+    display_name: "Eastern Armenian National Corpus"
+    type: corpus
+    provider_key: eanc_eastern_corpus
+    provider_type: corpus
+    evidence_role: corpus_attestation
+    language_variant: eastern
+    language_profile: eastern
+    enabled: false
+    priority: 20
+    can_validate_word: false
+    can_attest_usage: true
+    can_suggest_lemma: false
+    can_suggest_named_entity: false
+    requires_exact_match: false
+    requires_structured_headword: false
+    default_runtime: disabled
+    independent_source_group: eanc
+    source_kind: corpus
+    notes: "Future Eastern Armenian corpus attestation source. Do not import until licensing/access is clear."
+
+  - key: nayiri_western_corpus
+    display_name: "Nayiri Western Armenian Corpus"
+    type: corpus
+    provider_key: nayiri_western_corpus
+    provider_type: corpus
+    evidence_role: corpus_attestation
+    language_variant: western
+    language_profile: western
+    license: see-project-readme
+    source_url: https://www.nayiri.com
+    local_path: ../nayiri-corpus-of-western-armenian-2026-02-25-v2
+    version: 2026-02-25-v2
+    enabled: true
+    priority: 21
+    can_validate_word: false
+    can_attest_usage: true
+    can_suggest_lemma: false
+    can_suggest_named_entity: false
+    requires_exact_match: false
+    requires_structured_headword: false
+    default_runtime: local
+    independent_source_group: nayiri_corpus
+    source_kind: corpus
+    notes: "Western Armenian attestation source. Corpus hit does not equal dictionary definition."
+
+  - key: pioner_ner
+    display_name: "pioNER Armenian Named Entity Dataset"
+    type: ner_dataset
+    provider_key: pioner_ner
+    provider_type: ner
+    evidence_role: named_entity_signal
+    language_variant: eastern
+    language_profile: eastern
+    license: Apache-2.0
+    source_url: https://github.com/ispras-texterra/pioner
+    local_path: ../data/pioner
+    version: unknown
+    enabled: false
+    priority: 30
+    can_validate_word: false
+    can_attest_usage: false
+    can_suggest_lemma: false
+    can_suggest_named_entity: true
+    requires_exact_match: false
+    requires_structured_headword: false
+    default_runtime: local
+    independent_source_group: pioner
+    source_kind: ner
+    notes: "PER/ORG/LOC signal only. Not lexical validation."
+
+  - key: nayiri_web
+    display_name: "Nayiri Web / Page Results"
+    type: external_reference
+    provider_key: nayiri_web
+    provider_type: external_reference
+    evidence_role: classified_external_result
+    language_variant: mixed
+    language_profile: mixed
+    enabled: true
+    priority: 50
+    can_validate_word: conditional
+    can_attest_usage: false
+    can_suggest_lemma: false
+    can_suggest_named_entity: false
+    requires_exact_match: true
+    requires_structured_headword: true
+    default_runtime: cached_only
+    independent_source_group: nayiri_web
+    source_kind: external
+    notes: "May return dictionary/page/full-text results. Validate only exact structured headword matches. Page results are context only."
+
+  - key: hye_calfa_ocr
+    display_name: Tesseract hye-calfa OCR
+    type: ocr_model
+    language_variant: mixed
+    license: tessdata
+    source_url: https://github.com/tesseract-ocr/tessdata
+    local_path: ../data/tessdata
+    version: hye-calfa-n
+    enabled: true
+    priority: 90
+    provider_key: tesseract
+    provider_type: ocr
+    evidence_role: ocr_input
+    language_profile: mixed
+    can_validate_word: false
+    default_runtime: local
+    source_kind: external
+    notes: Existing OCR model configuration.

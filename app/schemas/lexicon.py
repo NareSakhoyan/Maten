@@ -19,6 +19,19 @@ class LexiconGroupView(str, enum.Enum):
     ALL = "all"
 
 
+class LexiconGroupSortKey(str, enum.Enum):
+    NORMALIZED_FORM = "normalized_form"
+    OCCURRENCE_COUNT = "occurrence_count"
+    PAGE_COUNT = "page_count"
+    GROUP_STATE = "group_state"
+    DOMINANT_SCRIPT_TYPE = "dominant_script_type"
+
+
+class LexiconGroupSortDirection(str, enum.Enum):
+    ASC = "asc"
+    DESC = "desc"
+
+
 class LexiconGroupState(str, enum.Enum):
     UNREVIEWED = "unreviewed"
     LINKED = "linked"
@@ -32,9 +45,13 @@ class LexiconGroupOccurrenceRead(APIModel):
     original_filename: str | None = None
     page_id: UUID
     page_number: int
+    page_image_available: bool = False
+    page_image_api_path: str | None = None
     token: str
     normalized_token: str
     context_snippet: str
+    context_highlight_start: int | None = None
+    context_highlight_end: int | None = None
     created_at: datetime
 
 
@@ -78,15 +95,33 @@ class LexiconGroupListResponse(OffsetPagination):
     items: list[LexiconGroupSummary]
 
 
-class LexiconGroupIgnoreRequest(APIModel):
+class LexiconIndexRebuildResponse(APIModel):
+    message: str
+    form_count: int | None = None
+    document_count: int | None = None
+    task_id: str | None = None
+
+
+class LexiconActionType(str, enum.Enum):
+    CREATE_LEXEME = "create_lexeme"
+    MERGE_INTO_LEXEME = "merge_into_lexeme"
+    IGNORE = "ignore"
+    UNIGNORE = "unignore"
+
+
+class LexiconActionRequest(APIModel):
+    action: LexiconActionType
     normalized_forms: list[str] = Field(min_length=1)
+    lexeme_id: UUID | None = None
+    canonical_form: str | None = None
+    status: str | None = None
+    notes: str | None = None
     reviewer_note: str | None = None
 
 
-class LexiconGroupUnignoreRequest(APIModel):
-    normalized_forms: list[str] = Field(min_length=1)
-
-
-class LexiconGroupReviewActionResponse(APIModel):
+class LexiconActionResponse(APIModel):
+    action: LexiconActionType
     normalized_forms: list[str]
-    group_state: LexiconGroupState
+    group_state: LexiconGroupState | None = None
+    lexeme_id: UUID | None = None
+    lexeme_canonical_form: str | None = None

@@ -6,7 +6,16 @@ from uuid import UUID
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from app.db.models import Document, Lexeme, LexemeForm, Occurrence, ReferenceEntry, ReferenceSource
+from app.db.models import (
+    Document,
+    Lexeme,
+    LexemeForm,
+    MorphologyAnalysis,
+    MorphologyAnalysisStatus,
+    Occurrence,
+    ReferenceEntry,
+    ReferenceSource,
+)
 from app.schemas.word import (
     TrustedExternalWordCheckSource,
     WordCheckLexeme,
@@ -119,9 +128,8 @@ class WordSearchService:
                 .order_by(Lexeme.created_at.asc(), Lexeme.id.asc())
             )
         )
-        trusted_external_batch = self.external_lookup_service.lookup(
+        trusted_external_batch = self.external_lookup_service.lookup_cached(
             session,
-            user_id=user_id,
             query=query.strip(),
             mode=WordSearchMode.NORMALIZED,
             provider_keys=provider_keys,
@@ -139,37 +147,37 @@ class WordSearchService:
                 )
                 for lexeme in lexeme_rows
             ],
-            found_in_imported_books=bool(
-                session.scalar(
-                    select(func.count(Occurrence.id))
-                    .join(Document, Occurrence.document_id == Document.id)
-                    .where(
-                        Document.user_id == user_id,
-                        Occurrence.normalized_token == normalized_query,
-                    )
-                )
+            found_in_imported_books=self._found_in_imported_books(
+                session,
+                user_id=user_id,
+                normalized_query=normalized_query,
             ),
-            found_in_reference_sources=bool(
-                session.scalar(
-                    select(func.count(ReferenceEntry.id))
-                    .join(ReferenceSource, ReferenceEntry.source_id == ReferenceSource.id)
-                    .where(
-                        ReferenceSource.user_id == user_key,
-                        ReferenceEntry.normalized_form == normalized_query,
-                    )
-                )
+            found_in_reference_sources=self._found_in_reference_sources(
+                session,
+                user_key=user_key,
+                normalized_query=normalized_query,
             ),
-            found_in_trusted_external=bool(trusted_external_batch.items),
-            trusted_external_status=trusted_external_batch.status if include_external else None,
-            trusted_external_match_count=len(trusted_external_batch.items),
-            trusted_external_sources=[
-                TrustedExternalWordCheckSource(
-                    provider_display_name=item.provider_display_name,
-                    matched_form=item.matched_form,
-                    reference_link=item.reference_link,
-                )
-                for item in trusted_external_batch.items
-            ],
+            found_in_trusted_external=self._found_in_trusted_external(
+                query=query.strip(),
+                normalized_query=normalized_query,
+                cached_batch=trusted_external_batch,
+            ),
+            trusted_external_status=self._trusted_external_check_status(
+                include_external=include_external,
+                cached_batch=trusted_external_batch,
+                query=query.strip(),
+                normalized_query=normalized_query,
+            ),
+            trusted_external_match_count=self._trusted_external_match_count(
+                query=query.strip(),
+                normalized_query=normalized_query,
+                cached_batch=trusted_external_batch,
+            ),
+            trusted_external_sources=self._trusted_external_check_sources(
+                query=query.strip(),
+                normalized_query=normalized_query,
+                cached_batch=trusted_external_batch,
+            ),
         )
 
     def _category_items(
@@ -193,7 +201,9 @@ class WordSearchService:
                 provider_keys=provider_keys,
             )
 
-        if mode is WordSearchMode.FUZZY:
+        if mode is WordSearchMode.FUZZY and len(normalized_query) <= 2:
+            normalized_forms = []
+        elif mode is WordSearchMode.FUZZY:
             normalized_forms = self._fuzzy_forms_for_category(
                 session,
                 user_id=user_id,
@@ -215,29 +225,41 @@ class WordSearchService:
                 )
             elif category is WordSearchCategory.IMPORTED_BOOKS:
                 items.extend(
-                    self.word_evidence_service.document_occurrence_evidence(
-                        session,
-                        user_id=user_id,
-                        normalized_form=normalized_form,
+                    self.word_evidence_service._merge_document_evidence(
+                        self.word_evidence_service.document_occurrence_evidence(
+                            session,
+                            user_id=user_id,
+                            normalized_form=normalized_form,
+                        ),
+                        self.word_evidence_service.document_lemma_evidence(
+                            session,
+                            user_id=user_id,
+                            lemma_normalized=normalized_form,
+                        ),
                     )
                 )
             elif category is WordSearchCategory.REFERENCE_SOURCES:
                 items.extend(
-                    self.word_evidence_service.reference_source_evidence(
-                        session,
-                        user_id=user_id,
-                        normalized_form=normalized_form,
+                    self.word_evidence_service._merge_reference_evidence(
+                        self.word_evidence_service.reference_source_evidence(
+                            session,
+                            user_id=user_id,
+                            normalized_form=normalized_form,
+                        ),
+                        self.word_evidence_service.reference_lemma_evidence(
+                            session,
+                            user_id=user_id,
+                            lemma_normalized=normalized_form,
+                        ),
                     )
                 )
 
-        if mode is WordSearchMode.EXACT:
-            items = [
-                item
-                for item in items
-                if item.word_form == query or item.normalized_form == normalized_query
-            ]
-        elif mode is WordSearchMode.NORMALIZED:
-            items = [item for item in items if item.normalized_form == normalized_query]
+        items = self._filter_items_by_mode(
+            items,
+            query=query,
+            normalized_query=normalized_query,
+            mode=mode,
+        )
 
         items.sort(
             key=lambda item: (
@@ -259,14 +281,15 @@ class WordSearchService:
         mode: WordSearchMode,
         provider_keys: list[str] | None,
     ) -> tuple[list[WordEvidenceItem], TrustedExternalLookupStatus]:
-        batch = self.external_lookup_service.lookup(
+        if mode is WordSearchMode.FUZZY and len(normalized_query) <= 2:
+            return [], TrustedExternalLookupStatus.NO_RESULTS
+        batch = self.external_lookup_service.lookup_cached(
             session,
-            user_id=user_id,
             query=query,
             mode=mode,
             provider_keys=provider_keys,
         )
-        result_items = [
+        cached_items = [
             WordEvidenceItem(
                 word_form=item.matched_form,
                 matched_form=item.matched_form,
@@ -286,6 +309,17 @@ class WordSearchService:
             )
             for item in batch.items
         ]
+        corpus_items = self.word_evidence_service.nayiri_corpus_evidence(
+            query=query,
+            normalized_query=normalized_query,
+        )
+        result_items = self.word_evidence_service._merge_external_items(cached_items, corpus_items)
+        result_items = self._filter_items_by_mode(
+            result_items,
+            query=query,
+            normalized_query=normalized_query,
+            mode=mode,
+        )
         result_items.sort(
             key=lambda item: (
                 item.provider_display_name or "",
@@ -294,7 +328,15 @@ class WordSearchService:
                 item.reference_link or "",
             )
         )
-        return result_items, batch.status
+        status = self.word_evidence_service._trusted_external_status(batch.status, result_items)
+        if (
+            not result_items
+            and corpus_items == []
+            and self.word_evidence_service.resource_registry.resource_enabled("nayiri_western_corpus", default=True)
+            and batch.status is TrustedExternalLookupStatus.UNAVAILABLE
+        ):
+            status = TrustedExternalLookupStatus.NO_RESULTS
+        return result_items, status
 
     def _fuzzy_forms_for_category(
         self,
@@ -304,10 +346,12 @@ class WordSearchService:
         normalized_query: str,
         category: WordSearchCategory,
     ) -> list[str]:
+        if len(normalized_query) <= 2:
+            return []
         if category is WordSearchCategory.LEXICON:
             candidates = self._lexicon_normalized_forms(session, user_id=user_id)
         elif category is WordSearchCategory.IMPORTED_BOOKS:
-            candidates = list(
+            token_candidates = list(
                 session.scalars(
                     select(Occurrence.normalized_token)
                     .join(Document, Occurrence.document_id == Document.id)
@@ -316,8 +360,22 @@ class WordSearchService:
                     .order_by(Occurrence.normalized_token.asc())
                 )
             )
+            lemma_candidates = list(
+                session.scalars(
+                    select(MorphologyAnalysis.lemma_normalized)
+                    .join(Document, MorphologyAnalysis.document_id == Document.id)
+                    .where(
+                        Document.user_id == user_id,
+                        MorphologyAnalysis.analysis_status == MorphologyAnalysisStatus.COMPLETED,
+                        MorphologyAnalysis.lemma_normalized.is_not(None),
+                    )
+                    .distinct()
+                    .order_by(MorphologyAnalysis.lemma_normalized.asc())
+                )
+            )
+            candidates = [value for value in dict.fromkeys(token_candidates + lemma_candidates) if value]
         else:
-            candidates = list(
+            entry_candidates = list(
                 session.scalars(
                     select(ReferenceEntry.normalized_form)
                     .join(ReferenceSource, ReferenceEntry.source_id == ReferenceSource.id)
@@ -326,6 +384,20 @@ class WordSearchService:
                     .order_by(ReferenceEntry.normalized_form.asc())
                 )
             )
+            lemma_candidates = list(
+                session.scalars(
+                    select(MorphologyAnalysis.lemma_normalized)
+                    .join(ReferenceSource, MorphologyAnalysis.reference_source_id == ReferenceSource.id)
+                    .where(
+                        ReferenceSource.user_id == str(user_id),
+                        MorphologyAnalysis.analysis_status == MorphologyAnalysisStatus.COMPLETED,
+                        MorphologyAnalysis.lemma_normalized.is_not(None),
+                    )
+                    .distinct()
+                    .order_by(MorphologyAnalysis.lemma_normalized.asc())
+                )
+            )
+            candidates = [value for value in dict.fromkeys(entry_candidates + lemma_candidates) if value]
         scored = [
             (candidate, self._similarity_score(normalized_query, candidate))
             for candidate in candidates
@@ -357,6 +429,174 @@ class WordSearchService:
     @staticmethod
     def _similarity_score(left: str, right: str) -> float:
         return float(SequenceMatcher(a=left, b=right).ratio() * 100)
+
+    @staticmethod
+    def _filter_items_by_mode(
+        items: list[WordEvidenceItem],
+        *,
+        query: str,
+        normalized_query: str,
+        mode: WordSearchMode,
+    ) -> list[WordEvidenceItem]:
+        if mode is WordSearchMode.FUZZY:
+            return items
+        if mode is WordSearchMode.EXACT:
+            return [
+                item
+                for item in items
+                if item.word_form == query
+                or item.matched_form == query
+                or (
+                    item.matched_form
+                    and normalize_token(item.matched_form) == normalized_query
+                    and item.normalized_form != normalized_query
+                )
+            ]
+        return [
+            item
+            for item in items
+            if item.normalized_form == normalized_query
+            or (item.matched_form and normalize_token(item.matched_form) == normalized_query)
+        ]
+
+    def _found_in_imported_books(
+        self,
+        session: Session,
+        *,
+        user_id: UUID,
+        normalized_query: str,
+    ) -> bool:
+        token_hit = session.scalar(
+            select(func.count(Occurrence.id))
+            .join(Document, Occurrence.document_id == Document.id)
+            .where(
+                Document.user_id == user_id,
+                Occurrence.normalized_token == normalized_query,
+            )
+        )
+        if token_hit:
+            return True
+        lemma_hit = session.scalar(
+            select(func.count(MorphologyAnalysis.id))
+            .join(Document, MorphologyAnalysis.document_id == Document.id)
+            .where(
+                Document.user_id == user_id,
+                MorphologyAnalysis.analysis_status == MorphologyAnalysisStatus.COMPLETED,
+                MorphologyAnalysis.lemma_normalized == normalized_query,
+            )
+        )
+        return bool(lemma_hit)
+
+    @staticmethod
+    def _found_in_reference_sources(
+        session: Session,
+        *,
+        user_key: str,
+        normalized_query: str,
+    ) -> bool:
+        token_hit = session.scalar(
+            select(func.count(ReferenceEntry.id))
+            .join(ReferenceSource, ReferenceEntry.source_id == ReferenceSource.id)
+            .where(
+                ReferenceSource.user_id == user_key,
+                ReferenceEntry.normalized_form == normalized_query,
+            )
+        )
+        if token_hit:
+            return True
+        lemma_hit = session.scalar(
+            select(func.count(MorphologyAnalysis.id))
+            .join(ReferenceEntry, MorphologyAnalysis.reference_entry_id == ReferenceEntry.id)
+            .join(ReferenceSource, ReferenceEntry.source_id == ReferenceSource.id)
+            .where(
+                ReferenceSource.user_id == user_key,
+                MorphologyAnalysis.analysis_status == MorphologyAnalysisStatus.COMPLETED,
+                MorphologyAnalysis.lemma_normalized == normalized_query,
+            )
+        )
+        return bool(lemma_hit)
+
+    def _found_in_trusted_external(
+        self,
+        *,
+        query: str,
+        normalized_query: str,
+        cached_batch: ExternalLookupBatch,
+    ) -> bool:
+        if cached_batch.items:
+            return True
+        return bool(
+            self.word_evidence_service.nayiri_corpus_evidence(
+                query=query,
+                normalized_query=normalized_query,
+                limit=1,
+            )
+        )
+
+    def _trusted_external_check_status(
+        self,
+        *,
+        include_external: bool,
+        cached_batch: ExternalLookupBatch,
+        query: str,
+        normalized_query: str,
+    ) -> TrustedExternalLookupStatus | None:
+        if self.word_evidence_service.nayiri_corpus_evidence(
+            query=query,
+            normalized_query=normalized_query,
+            limit=1,
+        ):
+            return TrustedExternalLookupStatus.COMPLETED
+        if cached_batch.items:
+            return cached_batch.status
+        if include_external:
+            return cached_batch.status
+        if self.word_evidence_service.resource_registry.resource_enabled("nayiri_western_corpus", default=True):
+            return TrustedExternalLookupStatus.NO_RESULTS
+        return None
+
+    def _trusted_external_match_count(
+        self,
+        *,
+        query: str,
+        normalized_query: str,
+        cached_batch: ExternalLookupBatch,
+    ) -> int:
+        return len(cached_batch.items) + len(
+            self.word_evidence_service.nayiri_corpus_evidence(
+                query=query,
+                normalized_query=normalized_query,
+            )
+        )
+
+    def _trusted_external_check_sources(
+        self,
+        *,
+        query: str,
+        normalized_query: str,
+        cached_batch: ExternalLookupBatch,
+    ) -> list[TrustedExternalWordCheckSource]:
+        sources = [
+            TrustedExternalWordCheckSource(
+                provider_display_name=item.provider_display_name or item.provider_key or "External",
+                matched_form=item.matched_form,
+                reference_link=item.reference_link,
+            )
+            for item in cached_batch.items
+        ]
+        for item in self.word_evidence_service.nayiri_corpus_evidence(
+            query=query,
+            normalized_query=normalized_query,
+            limit=5,
+        ):
+            sources.append(
+                TrustedExternalWordCheckSource(
+                    provider_display_name=item.provider_display_name or "Nayiri Corpus",
+                    matched_form=item.matched_form or item.word_form,
+                    reference_link=item.reference_link,
+                )
+            )
+        return sources
 
 
 def get_word_search_service() -> WordSearchService:

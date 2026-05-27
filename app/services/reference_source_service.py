@@ -1,12 +1,10 @@
 from __future__ import annotations
 
-import logging
 import re
 from uuid import UUID
 
-from sqlalchemy import inspect, select
-from sqlalchemy.exc import ProgrammingError
-from sqlalchemy.orm import Session
+from sqlalchemy import func, select
+from sqlalchemy.orm import Session, aliased
 
 from app.db.models import (
     ReferenceMatchingDirection,
@@ -27,42 +25,14 @@ from app.utils.text_normalization import normalize_unicode
 
 DEFAULT_REFERENCE_SOURCE_KEY = "manual_reference"
 DEFAULT_REFERENCE_SOURCE_NAME = "Manual Reference Source"
+DEFAULT_LANGUAGE_STAGE = "classical"
+DEFAULT_MORPHOLOGY_PROFILE = "xcl_pie"
 
 NON_WORD_RE = re.compile(r"\W+", re.UNICODE)
-REFERENCE_SOURCE_TABLES = ("reference_sources", "reference_entries", "reference_source_imports")
-REFERENCE_SOURCE_REQUIRED_COLUMNS = {
-    "reference_sources": {
-        "id",
-        "user_id",
-        "key",
-        "display_name",
-        "source_type",
-        "last_import_method",
-        "last_import_warning",
-        "last_imported_at",
-        "entry_count",
-    },
-    "reference_entries": {"id", "source_id", "surface_form", "normalized_form"},
-    "reference_source_imports": {
-        "id",
-        "source_id",
-        "user_id",
-        "retry_of_job_id",
-        "status",
-        "retry_count",
-        "can_retry",
-        "last_retried_at",
-        "progress_percent",
-        "current_stage_code",
-    },
-}
 
 
 class ReferenceSourceSchemaNotReadyError(RuntimeError):
     pass
-
-
-logger = logging.getLogger(__name__)
 
 
 class ReferenceSourceService:
@@ -84,6 +54,8 @@ class ReferenceSourceService:
             display_name=DEFAULT_REFERENCE_SOURCE_NAME,
             description="Default personal reference list for manual additions.",
             source_type=ReferenceSourceType.MANUAL,
+            language_stage=DEFAULT_LANGUAGE_STAGE,
+            morphology_profile=DEFAULT_MORPHOLOGY_PROFILE,
             is_active=True,
         )
         session.add(source)
@@ -112,6 +84,8 @@ class ReferenceSourceService:
             description=request.description.strip() if request.description else None,
             source_type=request.source_type,
             language=request.language.strip() if request.language else None,
+            language_stage=self._language_stage_or_default(request.language_stage),
+            morphology_profile=self._morphology_profile_or_default(request.morphology_profile),
             is_active=True,
         )
         session.add(source)
@@ -121,27 +95,46 @@ class ReferenceSourceService:
 
     def list_sources(self, session: Session, *, user_id: UUID) -> list[ReferenceSourceSummary]:
         self.ensure_reference_schema(session)
-        self.ensure_default_source(session, user_id=user_id)
+        user_key = str(user_id)
+        latest_import_rank = (
+            select(
+                ReferenceSourceImport.id,
+                ReferenceSourceImport.source_id,
+                func.row_number()
+                .over(
+                    partition_by=ReferenceSourceImport.source_id,
+                    order_by=(
+                        ReferenceSourceImport.created_at.desc(),
+                        ReferenceSourceImport.updated_at.desc(),
+                        ReferenceSourceImport.retry_count.desc(),
+                        ReferenceSourceImport.id.desc(),
+                    ),
+                )
+                .label("rank"),
+            )
+            .where(ReferenceSourceImport.user_id == user_key)
+            .subquery()
+        )
+        latest_import_alias = aliased(ReferenceSourceImport)
+
         rows = list(
-            session.scalars(
-                select(ReferenceSource)
-                .where(ReferenceSource.user_id == str(user_id))
+            session.execute(
+                select(ReferenceSource, latest_import_alias)
+                .outerjoin(
+                    latest_import_rank,
+                    (latest_import_rank.c.source_id == ReferenceSource.id)
+                    & (latest_import_rank.c.rank == 1),
+                )
+                .outerjoin(latest_import_alias, latest_import_alias.id == latest_import_rank.c.id)
+                .where(ReferenceSource.user_id == user_key)
                 .order_by(ReferenceSource.created_at.asc(), ReferenceSource.id.asc())
             )
         )
+        if not rows:
+            rows = [(self.ensure_default_source(session, user_id=user_id), None)]
+
         summaries: list[ReferenceSourceSummary] = []
-        for source in rows:
-            latest_import = session.scalar(
-                select(ReferenceSourceImport)
-                .where(ReferenceSourceImport.source_id == source.id)
-                .order_by(
-                    ReferenceSourceImport.created_at.desc(),
-                    ReferenceSourceImport.updated_at.desc(),
-                    ReferenceSourceImport.retry_count.desc(),
-                    ReferenceSourceImport.id.desc(),
-                )
-                .limit(1)
-            )
+        for source, latest_import in rows:
             summaries.append(
                 ReferenceSourceSummary(
                     id=source.id,
@@ -150,6 +143,8 @@ class ReferenceSourceService:
                     description=source.description,
                     source_type=source.source_type,
                     language=source.language,
+                    language_stage=source.language_stage,
+                    morphology_profile=source.morphology_profile,
                     is_active=source.is_active,
                     entry_count=source.entry_count,
                     last_import_method=source.last_import_method,
@@ -177,6 +172,25 @@ class ReferenceSourceService:
         source = self.get_user_source(session, user_id=user_id, source_id=source_id)
         if source is None:
             return None
+        return self.build_source_detail(session, source)
+
+    def update_morphology_settings(
+        self,
+        session: Session,
+        *,
+        user_id: UUID,
+        source_id: UUID,
+        language_stage: str | None,
+        morphology_profile: str | None,
+    ) -> ReferenceSourceDetail:
+        source = self.get_user_source(session, user_id=user_id, source_id=source_id)
+        if source is None:
+            raise ValueError("Reference source not found.")
+
+        source.language_stage = self._language_stage_or_default(language_stage)
+        source.morphology_profile = self._morphology_profile_or_default(morphology_profile)
+        session.commit()
+        session.refresh(source)
         return self.build_source_detail(session, source)
 
     @staticmethod
@@ -221,6 +235,8 @@ class ReferenceSourceService:
             description=source.description,
             source_type=source.source_type,
             language=source.language,
+            language_stage=source.language_stage,
+            morphology_profile=source.morphology_profile,
             is_active=source.is_active,
             entry_count=source.entry_count,
             last_import_method=source.last_import_method,
@@ -269,44 +285,19 @@ class ReferenceSourceService:
         slug = NON_WORD_RE.sub("_", normalized).strip("_")
         return slug or "reference_source"
 
-    def ensure_reference_schema(self, session: Session) -> None:
-        try:
-            inspector = inspect(session.connection())
-            missing_tables = [
-                table_name for table_name in REFERENCE_SOURCE_TABLES if not inspector.has_table(table_name)
-            ]
-            missing_columns = {
-                table_name: sorted(
-                    REFERENCE_SOURCE_REQUIRED_COLUMNS[table_name]
-                    - {column["name"] for column in inspector.get_columns(table_name)}
-                )
-                for table_name in REFERENCE_SOURCE_TABLES
-                if table_name not in missing_tables
-            }
-            missing_columns = {
-                table_name: columns
-                for table_name, columns in missing_columns.items()
-                if columns
-            }
-            if not missing_tables and not missing_columns:
-                return
-            logger.error(
-                "Reference source schema not ready: missing_tables=%s missing_columns=%s",
-                missing_tables,
-                missing_columns,
-            )
-        except ProgrammingError as exc:  # pragma: no cover - depends on live database state
-            if not self._is_missing_reference_table_error(exc):
-                raise
-            logger.error("Reference source schema inspection failed due to database schema error: %s", exc)
-        raise ReferenceSourceSchemaNotReadyError(
-            "Reference sources are temporarily unavailable."
-        )
+    @staticmethod
+    def _language_stage_or_default(value: str | None) -> str:
+        return value.strip() if isinstance(value, str) and value.strip() else DEFAULT_LANGUAGE_STAGE
 
     @staticmethod
-    def _is_missing_reference_table_error(exc: ProgrammingError) -> bool:
-        message = str(exc).lower()
-        return "undefinedtable" in message or "does not exist" in message or "no such table" in message
+    def _morphology_profile_or_default(value: str | None) -> str:
+        # TODO: Re-enable profile selection when more morphology tools are available.
+        return value.strip() if isinstance(value, str) and value.strip() else DEFAULT_MORPHOLOGY_PROFILE
+
+    def ensure_reference_schema(self, session: Session) -> None:
+        # Migrations are the schema contract. Runtime reflection is very slow
+        # against remote Supabase/Postgres and should not sit on request paths.
+        return
 
 
 def get_reference_source_service() -> ReferenceSourceService:

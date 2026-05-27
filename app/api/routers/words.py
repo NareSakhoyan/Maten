@@ -6,7 +6,11 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_user, get_db_session
+from app.core.security import forbidden
+from app.schemas.morphology import MorphologyWordResponse
 from app.schemas.word import (
+    NayiriCorpusCheckResponse,
+    NayiriCorpusMatchRead,
     WordCheckResponse,
     WordEvidenceResponse,
     WordEvidenceSourceType,
@@ -14,12 +18,32 @@ from app.schemas.word import (
     WordSearchMode,
     WordSearchResponse,
 )
+from app.services.nayiri_corpus_service import NayiriCorpusService, get_nayiri_corpus_service
 from app.services.auth_service import AuthenticatedUser
+from app.services.morphology.morphology_service import MorphologyService, get_morphology_service
 from app.services.word_evidence_service import WordEvidenceService, get_word_evidence_service
 from app.services.word_search_service import WordSearchService, get_word_search_service
+from app.utils.text_normalization import normalize_token
 
 
 router = APIRouter()
+
+
+def _resolve_word_evidence_source_type(raw_value: str | None) -> WordEvidenceSourceType | None:
+    if raw_value is None:
+        return None
+    normalized = raw_value.strip().lower()
+    if not normalized:
+        return None
+    if normalized in {"document", "documents", "book", "imported_book"}:
+        return WordEvidenceSourceType.IMPORTED_BOOK
+    if normalized in {"reference_source", "reference_sources"}:
+        return WordEvidenceSourceType.REFERENCE_SOURCE
+    if normalized in {"lexicon"}:
+        return WordEvidenceSourceType.LEXICON
+    if normalized in {"trusted_external", "external", "external_source", "trusted-external"}:
+        return WordEvidenceSourceType.TRUSTED_EXTERNAL
+    raise ValueError(f"Unsupported source_type: {raw_value}")
 
 
 def _resolve_search_categories(
@@ -52,13 +76,15 @@ def _resolve_search_categories(
         resolved_categories.append(WordSearchCategory.REFERENCE_SOURCES)
     if include_trusted_external:
         resolved_categories.append(WordSearchCategory.TRUSTED_EXTERNAL)
+    if not resolved_categories:
+        return None, bool(include_trusted_external)
     return resolved_categories, bool(include_trusted_external)
 
 
 @router.get("/word-evidence", response_model=WordEvidenceResponse)
 async def get_word_evidence(
     normalized_form: str = Query(..., min_length=1),
-    source_type: WordEvidenceSourceType | None = Query(default=None),
+    source_type: str | None = Query(default=None),
     source_id: str | None = Query(default=None),
     include_external: Annotated[bool, Query()] = False,
     provider_keys: Annotated[list[str] | None, Query()] = None,
@@ -68,17 +94,37 @@ async def get_word_evidence(
     session: Session = Depends(get_db_session),
     word_evidence_service: WordEvidenceService = Depends(get_word_evidence_service),
 ) -> WordEvidenceResponse:
+    if include_external and current_user.role != "admin":
+        raise forbidden("Admin access is required for external provider lookup.")
     try:
+        resolved_source_type = _resolve_word_evidence_source_type(source_type)
         return word_evidence_service.get_word_evidence(
             session,
             user_id=current_user.user_id,
             normalized_form=normalized_form,
-            source_type=source_type,
+            source_type=resolved_source_type,
             source_id=source_id,
             include_external=include_external,
             provider_keys=provider_keys,
             limit=limit,
             offset=offset,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+
+
+@router.get("/words/{normalized_form}/morphology", response_model=MorphologyWordResponse)
+async def get_word_morphology(
+    normalized_form: str,
+    current_user: AuthenticatedUser = Depends(get_current_user),
+    session: Session = Depends(get_db_session),
+    morphology_service: MorphologyService = Depends(get_morphology_service),
+) -> MorphologyWordResponse:
+    try:
+        return morphology_service.get_word_morphology(
+            session,
+            user_id=current_user.user_id,
+            normalized_form=normalized_form,
         )
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
@@ -108,6 +154,8 @@ async def search_words(
             include_reference_sources=include_reference_sources,
             include_trusted_external=include_trusted_external,
         )
+        if (include_external or resolved_include_external or provider_keys) and current_user.role != "admin":
+            raise forbidden("Admin access is required for external provider lookup.")
         return word_search_service.search(
             session,
             user_id=current_user.user_id,
@@ -131,6 +179,8 @@ async def check_word(
     session: Session = Depends(get_db_session),
     word_search_service: WordSearchService = Depends(get_word_search_service),
 ) -> WordCheckResponse:
+    if (include_external or provider_keys) and current_user.role != "admin":
+        raise forbidden("Admin access is required for external provider lookup.")
     try:
         return word_search_service.check(
             session,
@@ -141,3 +191,28 @@ async def check_word(
         )
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+
+
+@router.get("/words/nayiri-corpus/check", response_model=NayiriCorpusCheckResponse)
+async def check_word_in_nayiri_corpus(
+    q: str = Query(..., min_length=1),
+    limit: int = Query(default=8, ge=1, le=30),
+    current_user: AuthenticatedUser = Depends(get_current_user),
+    nayiri_corpus_service: NayiriCorpusService = Depends(get_nayiri_corpus_service),
+) -> NayiriCorpusCheckResponse:
+    matches = nayiri_corpus_service.lookup(q, limit=limit)
+    normalized_query = matches[0].normalized_query if matches else (normalize_token(q) or q)
+    return NayiriCorpusCheckResponse(
+        query=q,
+        normalized_query=normalized_query,
+        found=bool(matches),
+        matches=[
+            NayiriCorpusMatchRead(
+                normalized_query=item.normalized_query,
+                canonical_form=item.canonical_form,
+                token_count=item.token_count,
+                source_count=item.source_count,
+            )
+            for item in matches
+        ],
+    )

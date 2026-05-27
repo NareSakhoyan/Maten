@@ -33,6 +33,9 @@ dev = [
   "httpx>=0.27,<1.0",
   "pytest>=8.3,<9.0",
 ]
+pioner = [
+  "datasets>=2.20,<4.0",
+]
 
 [project.scripts]
 bootstrap-storage = "app.scripts.bootstrap_storage:main"
