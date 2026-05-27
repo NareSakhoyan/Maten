@@ -22,6 +22,12 @@ class HealthResponse(BaseModel):
     status: str
 
 
+class CurrentUserProfile(APIModel):
+    id: UUID
+    email: str | None = None
+    role: str
+
+
 class HealthComponentStatus(APIModel):
     status: str
     detail: str | None = None

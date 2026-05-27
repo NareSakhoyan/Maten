@@ -58,6 +58,7 @@ async def get_job(
 @router.get("/{job_id}/events", response_model=JobStageEventListResponse)
 async def list_job_events(
     job_id: UUID,
+    job_kind: JobKind | None = Query(default=None),
     limit: int = Query(default=100, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
     current_user: AuthenticatedUser = Depends(get_current_user),
@@ -65,7 +66,19 @@ async def list_job_events(
     long_running_job_service: LongRunningJobService = Depends(get_long_running_job_service),
     job_progress_service: JobProgressService = Depends(get_job_progress_service),
 ) -> JobStageEventListResponse:
-    job = long_running_job_service.get_user_job(session, user_id=current_user.user_id, job_id=job_id)
+    if job_kind is not None:
+        job = long_running_job_service.get_user_job_by_kind(
+            session,
+            user_id=current_user.user_id,
+            job_id=job_id,
+            job_kind=job_kind,
+        )
+    else:
+        job = long_running_job_service.get_user_job(
+            session,
+            user_id=current_user.user_id,
+            job_id=job_id,
+        )
     if job is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found.")
     events = job_progress_service.list_events(

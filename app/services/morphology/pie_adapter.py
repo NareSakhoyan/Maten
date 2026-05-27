@@ -33,7 +33,7 @@ class PieAdapter:
                 key: value
                 for key, value in prediction.columns.items()
                 if key not in {"token", "form", "word", "surface", "lemma", "pos", "upos", "xpos", "feats", "morph"}
-                and value not in {None, "", "_"}
+                and value not in {None, "", "_", "-"}
             }
             if fallback_features:
                 morph_features = self._parse_morph_features(fallback_features)
@@ -50,7 +50,7 @@ class PieAdapter:
         if value is None:
             return None
         text = str(value).strip()
-        if not text or text == "_":
+        if not text or text in {"_", "-"}:
             return None
         return text
 
@@ -78,6 +78,8 @@ class PieAdapter:
             feature = item.strip()
             if not feature:
                 continue
+            if feature == "-":
+                continue
             if "=" not in feature:
                 features[feature] = True
                 continue
@@ -97,7 +99,7 @@ class PieAdapter:
             normalized_values = [
                 str(item).strip()
                 for item in value
-                if str(item).strip() and str(item).strip() != "_"
+                if str(item).strip() and str(item).strip() not in {"_", "-"}
             ]
             if not normalized_values:
                 return None
@@ -106,7 +108,7 @@ class PieAdapter:
             return sorted(dict.fromkeys(normalized_values))
 
         text = str(value).strip()
-        if not text or text == "_":
+        if not text or text in {"_", "-"}:
             return None
         if "," in text:
             values = [item.strip() for item in text.split(",") if item.strip()]

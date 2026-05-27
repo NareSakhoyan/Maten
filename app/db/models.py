@@ -151,6 +151,7 @@ class JobKind(str, enum.Enum):
     REFERENCE_MATCHING = "reference_matching"
     MORPHOLOGY = "morphology"
     NAYIRI_TRUSTED_LOOKUP = "nayiri_trusted_lookup"
+    DISCOVERY_BUILD = "discovery_build"
 
 
 class JobResultResourceType(str, enum.Enum):
@@ -230,7 +231,15 @@ class Document(UpdatedTimestampMixin, Base):
         back_populates="document",
         cascade="all, delete-orphan",
     )
+    discovery_build_runs: Mapped[list["DiscoveryBuildRun"]] = relationship(
+        back_populates="document",
+        cascade="all, delete-orphan",
+    )
     morphology_analyses: Mapped[list["MorphologyAnalysis"]] = relationship(
+        back_populates="document",
+        cascade="all, delete-orphan",
+    )
+    discovery_candidates: Mapped[list["DiscoveryCandidate"]] = relationship(
         back_populates="document",
         cascade="all, delete-orphan",
     )
@@ -320,6 +329,7 @@ class LexiconGroupIndexDocument(Base):
     __tablename__ = "lexicon_group_index_documents"
     __table_args__ = (
         Index("ix_lexicon_group_index_documents_document", "user_id", "document_id"),
+        Index("ix_lexicon_group_index_documents_document_form", "user_id", "document_id", "normalized_form"),
     )
 
     user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
@@ -389,6 +399,7 @@ class Occurrence(TimestampMixin, Base):
     __table_args__ = (
         Index("ix_occurrences_document_id", "document_id"),
         Index("ix_occurrences_normalized_token", "normalized_token"),
+        Index("ix_occurrences_document_normalized_token", "document_id", "normalized_token"),
         Index("ix_occurrences_document_page_number", "document_id", "page_number"),
         Index("ix_occurrences_lexeme_id", "lexeme_id"),
         Index("ix_occurrences_script_type", "script_type"),
@@ -439,6 +450,51 @@ class Occurrence(TimestampMixin, Base):
     )
 
 
+class DiscoveryCandidate(UpdatedTimestampMixin, Base):
+    __tablename__ = "discovery_candidates"
+    __table_args__ = (
+        UniqueConstraint("user_id", "document_id", "normalized_form", name="uq_discovery_candidates_user_document_form"),
+        Index("ix_discovery_candidates_user_document_review", "user_id", "document_id", "review_status"),
+        Index("ix_discovery_candidates_user_document_type", "user_id", "document_id", "candidate_type"),
+        Index("ix_discovery_candidates_user_document_resolution", "user_id", "document_id", "resolution_status"),
+        Index("ix_discovery_candidates_user_document_interest", "user_id", "document_id", "interest_score"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    document_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("documents.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    normalized_form: Mapped[str] = mapped_column(Text, nullable=False)
+    canonical_form_candidate: Mapped[str | None] = mapped_column(Text, nullable=True)
+    occurrence_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    page_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    sample_tokens: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
+    sample_contexts: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
+    sample_pages: Mapped[list[int]] = mapped_column(JSON, nullable=False, default=list)
+    resolution_status: Mapped[str] = mapped_column(Text, nullable=False)
+    candidate_type: Mapped[str] = mapped_column(Text, nullable=False)
+    interest_score: Mapped[float] = mapped_column(Numeric(6, 2), nullable=False, default=0)
+    confidence_score: Mapped[float | None] = mapped_column(Numeric(5, 2), nullable=True)
+    ocr_risk_score: Mapped[float | None] = mapped_column(Numeric(5, 2), nullable=True)
+    morphology_plausibility_score: Mapped[float | None] = mapped_column(Numeric(5, 2), nullable=True)
+    definition_quality_score: Mapped[float | None] = mapped_column(Numeric(5, 2), nullable=True)
+    best_evidence_summary: Mapped[dict[str, object]] = mapped_column(JSON, nullable=False, default=dict)
+    review_status: Mapped[str] = mapped_column(Text, nullable=False, default="unreviewed")
+    reviewer_decision: Mapped[str | None] = mapped_column(Text, nullable=True)
+    reviewer_note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    linked_lexeme_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("lexemes.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+
+    document: Mapped["Document"] = relationship(back_populates="discovery_candidates")
+    linked_lexeme: Mapped["Lexeme | None"] = relationship()
+
+
 class Lexeme(UpdatedTimestampMixin, Base):
     __tablename__ = "lexemes"
     __table_args__ = (
@@ -487,6 +543,37 @@ class LexemeForm(TimestampMixin, Base):
     normalized_form: Mapped[str] = mapped_column(Text, nullable=False)
 
     lexeme: Mapped["Lexeme"] = relationship(back_populates="forms")
+
+
+class LexemeFormMapping(UpdatedTimestampMixin, Base):
+    __tablename__ = "lexeme_form_mappings"
+    __table_args__ = (
+        UniqueConstraint(
+            "normalized_surface_form",
+            "normalized_dictionary_lemma",
+            "language_profile",
+            "source_type",
+            name="uq_lexeme_form_mappings_form_lemma_profile_source",
+        ),
+        Index("ix_lexeme_form_mappings_user_form", "user_id", "normalized_surface_form"),
+        Index("ix_lexeme_form_mappings_user_lemma", "user_id", "normalized_dictionary_lemma"),
+        Index("ix_lexeme_form_mappings_source", "source_key"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    surface_form: Mapped[str] = mapped_column(Text, nullable=False)
+    normalized_surface_form: Mapped[str] = mapped_column(Text, nullable=False)
+    dictionary_lemma: Mapped[str] = mapped_column(Text, nullable=False)
+    normalized_dictionary_lemma: Mapped[str] = mapped_column(Text, nullable=False)
+    pos: Mapped[str | None] = mapped_column(Text, nullable=True)
+    language_profile: Mapped[str] = mapped_column(Text, nullable=False, default="unknown")
+    mapping_type: Mapped[str] = mapped_column(Text, nullable=False)
+    source_type: Mapped[str] = mapped_column(Text, nullable=False)
+    source_key: Mapped[str | None] = mapped_column(Text, nullable=True)
+    confidence: Mapped[float | None] = mapped_column(Numeric(5, 2), nullable=True)
+    review_status: Mapped[str] = mapped_column(Text, nullable=False, default="pending")
+    notes: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
 class LexiconGroupReview(UpdatedTimestampMixin, Base):
@@ -618,10 +705,69 @@ class ReferenceEntry(UpdatedTimestampMixin, Base):
     )
 
 
+class NerSource(UpdatedTimestampMixin, Base):
+    __tablename__ = "ner_sources"
+    __table_args__ = (
+        UniqueConstraint("provider_key", "source_kind", "dataset_split", name="uq_ner_sources_provider_kind_split"),
+        Index("ix_ner_sources_provider_key", "provider_key"),
+        Index("ix_ner_sources_active", "is_active"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    provider_key: Mapped[str] = mapped_column(Text, nullable=False)
+    display_name: Mapped[str] = mapped_column(Text, nullable=False)
+    source_kind: Mapped[str] = mapped_column(Text, nullable=False)
+    dataset_split: Mapped[str] = mapped_column(Text, nullable=False, default="unknown")
+    source_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    license: Mapped[str | None] = mapped_column(Text, nullable=True)
+    version: Mapped[str | None] = mapped_column(Text, nullable=True)
+    is_active: Mapped[bool] = mapped_column(nullable=False, default=True)
+    metadata_json: Mapped[dict[str, object] | None] = mapped_column(JSON, nullable=True)
+
+    entries: Mapped[list["NerEntityEntry"]] = relationship(
+        back_populates="source",
+        cascade="all, delete-orphan",
+    )
+
+
+class NerEntityEntry(UpdatedTimestampMixin, Base):
+    __tablename__ = "ner_entity_entries"
+    __table_args__ = (
+        Index("ix_ner_entity_entries_source_id", "source_id"),
+        Index("ix_ner_entity_entries_normalized_surface", "normalized_surface"),
+        Index("ix_ner_entity_entries_entity_type", "entity_type"),
+        Index("ix_ner_entity_entries_source_normalized", "source_id", "normalized_surface"),
+        UniqueConstraint(
+            "source_id",
+            "entity_surface",
+            "normalized_surface",
+            "entity_type",
+            name="uq_ner_entity_entries_source_surface_type",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    source_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("ner_sources.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    entity_surface: Mapped[str] = mapped_column(Text, nullable=False)
+    normalized_surface: Mapped[str] = mapped_column(Text, nullable=False)
+    entity_type: Mapped[str] = mapped_column(Text, nullable=False)
+    occurrence_count: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    confidence: Mapped[float | None] = mapped_column(Numeric(5, 2), nullable=True)
+    sample_contexts: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
+    metadata_json: Mapped[dict[str, object] | None] = mapped_column(JSON, nullable=True)
+
+    source: Mapped["NerSource"] = relationship(back_populates="entries")
+
+
 class MorphologyRun(UpdatedTimestampMixin, Base):
     __tablename__ = "morphology_runs"
     __table_args__ = (
         Index("ix_morphology_runs_user_id", "user_id"),
+        Index("ix_morphology_runs_user_status_created", "user_id", "status", "created_at"),
         Index("ix_morphology_runs_document_id", "document_id"),
         Index("ix_morphology_runs_reference_source_id", "reference_source_id"),
     )
@@ -687,7 +833,10 @@ class MorphologyRun(UpdatedTimestampMixin, Base):
 
 class DocumentNayiriLookupRun(UpdatedTimestampMixin, Base):
     __tablename__ = "document_nayiri_lookup_runs"
-    __table_args__ = (Index("ix_document_nayiri_lookup_runs_user_id", "user_id"),)
+    __table_args__ = (
+        Index("ix_document_nayiri_lookup_runs_user_id", "user_id"),
+        Index("ix_document_nayiri_lookup_runs_user_status_created", "user_id", "status", "created_at"),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     user_id: Mapped[str] = mapped_column(Text, nullable=False)
@@ -740,6 +889,85 @@ class DocumentNayiriLookupRun(UpdatedTimestampMixin, Base):
     document: Mapped["Document"] = relationship(back_populates="nayiri_lookup_runs")
 
 
+class DiscoveryBuildRun(UpdatedTimestampMixin, Base):
+    __tablename__ = "discovery_build_runs"
+    __table_args__ = (
+        Index("ix_discovery_build_runs_user_id", "user_id"),
+        Index("ix_discovery_build_runs_user_status_created", "user_id", "status", "created_at"),
+        Index("ix_discovery_build_runs_document_id", "document_id"),
+        Index("ix_discovery_build_runs_reference_source_id", "reference_source_id"),
+        Index("ix_discovery_build_runs_reference_import_id", "reference_source_import_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id: Mapped[str] = mapped_column(Text, nullable=False)
+    document_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("documents.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    build_mode: Mapped[str] = mapped_column(Text, nullable=False, default="full")
+    reference_source_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("reference_sources.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    reference_source_import_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("reference_source_imports.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    status: Mapped[MorphologyRunStatus] = mapped_column(
+        SqlEnum(
+            MorphologyRunStatus,
+            name="morphology_run_status",
+            values_callable=enum_values,
+            validate_strings=True,
+            create_constraint=False,
+        ),
+        nullable=False,
+        default=MorphologyRunStatus.QUEUED,
+    )
+    candidate_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    shown_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    suppressed_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    matched_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    unmatched_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    summary_counts: Mapped[dict[str, object] | None] = mapped_column(JSON, nullable=True)
+    current_stage_code: Mapped[str | None] = mapped_column(Text, nullable=True)
+    current_stage_label: Mapped[str | None] = mapped_column(Text, nullable=True)
+    stage_message_user: Mapped[str | None] = mapped_column(Text, nullable=True)
+    progress_percent: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    items_processed: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    items_total: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    error_code: Mapped[str | None] = mapped_column(Text, nullable=True)
+    error_message_user: Mapped[str | None] = mapped_column(Text, nullable=True)
+    next_steps: Mapped[list[str] | None] = mapped_column(JSON, nullable=True)
+    result_resource_type: Mapped[JobResultResourceType | None] = mapped_column(
+        SqlEnum(
+            JobResultResourceType,
+            name="job_result_resource_type",
+            values_callable=enum_values,
+            validate_strings=True,
+            create_constraint=False,
+        ),
+        nullable=True,
+    )
+    result_resource_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    retry_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    can_retry: Mapped[bool] = mapped_column(nullable=False, default=False)
+    last_retried_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    document: Mapped["Document"] = relationship(back_populates="discovery_build_runs")
+    reference_source: Mapped["ReferenceSource | None"] = relationship(foreign_keys=[reference_source_id])
+    reference_source_import: Mapped["ReferenceSourceImport | None"] = relationship(
+        foreign_keys=[reference_source_import_id],
+    )
+
+
 class MorphologyAnalysis(UpdatedTimestampMixin, Base):
     __tablename__ = "morphology_analyses"
     __table_args__ = (
@@ -748,6 +976,8 @@ class MorphologyAnalysis(UpdatedTimestampMixin, Base):
         Index("ix_morphology_analyses_token_normalized", "token_normalized"),
         Index("ix_morphology_analyses_lemma_normalized", "lemma_normalized"),
         Index("ix_morphology_analyses_user_document", "user_id", "document_id"),
+        Index("ix_morphology_analyses_user_document_token", "user_id", "document_id", "token_normalized"),
+        Index("ix_morphology_analyses_user_document_lemma", "user_id", "document_id", "lemma_normalized"),
         Index("ix_morphology_analyses_reference_source_id", "reference_source_id"),
     )
 
@@ -810,6 +1040,7 @@ class ReferenceMatchRun(UpdatedTimestampMixin, Base):
     __tablename__ = "reference_match_runs"
     __table_args__ = (
         Index("ix_reference_match_runs_user_id", "user_id"),
+        Index("ix_reference_match_runs_user_status_created", "user_id", "status", "created_at"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
@@ -1145,6 +1376,7 @@ class ReferenceSourceImport(UpdatedTimestampMixin, Base):
     __table_args__ = (
         Index("ix_reference_source_imports_source_id", "source_id"),
         Index("ix_reference_source_imports_user_id", "user_id"),
+        Index("ix_reference_source_imports_user_status_created", "user_id", "status", "created_at"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
@@ -1362,6 +1594,9 @@ class JobStageEvent(TimestampMixin, Base):
 
 class IngestionJob(UpdatedTimestampMixin, Base):
     __tablename__ = "ingestion_jobs"
+    __table_args__ = (
+        Index("ix_ingestion_jobs_user_status_created", "user_id", "status", "created_at"),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     document_id: Mapped[uuid.UUID] = mapped_column(

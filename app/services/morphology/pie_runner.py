@@ -7,6 +7,7 @@ import shutil
 import subprocess
 
 from app.core.config import Settings, get_settings
+from app.core.resource_registry import ResourceRegistry, get_resource_registry
 
 
 class PieRuntimeError(RuntimeError):
@@ -23,10 +24,11 @@ class PieRawPrediction:
 
 
 class PieRunner:
-    def __init__(self, settings: Settings | None = None) -> None:
+    def __init__(self, settings: Settings | None = None, resource_registry: ResourceRegistry | None = None) -> None:
         self.settings = settings or get_settings()
+        self.resource_registry = resource_registry or get_resource_registry()
 
-    def analyze_sequences(self, sequences: list[list[str]]) -> list[list[PieRawPrediction]]:
+    def analyze_sequences(self, sequences: list[list[str]], *, profile: str | None = None) -> list[list[PieRawPrediction]]:
         if not self.settings.pie_enabled:
             raise PieRuntimeError("PIE morphology analysis is disabled.")
         if not sequences:
@@ -41,7 +43,7 @@ class PieRunner:
                 "Install the PIE CLI in the worker environment or point PIE_EXECUTABLE to the full binary path."
             )
 
-        model_spec = self._resolve_model_spec()
+        model_spec = self._resolve_model_spec(profile=profile)
         payload = "\n".join(" ".join(sequence) for sequence in sequences) + "\n"
         completed = subprocess.run(
             [pie_binary, "tag-pipe", *shlex.split(model_spec)],
@@ -49,6 +51,7 @@ class PieRunner:
             capture_output=True,
             text=True,
             check=False,
+            timeout=self.settings.pie_timeout_seconds,
         )
         if completed.returncode != 0:
             stderr = completed.stderr.strip() or completed.stdout.strip() or "Unknown PIE failure."
@@ -77,8 +80,8 @@ class PieRunner:
 
         return shutil.which(configured)
 
-    def _resolve_model_spec(self) -> str:
-        model_root = self.settings.pie_model_root
+    def _resolve_model_spec(self, *, profile: str | None = None) -> str:
+        model_root = self._model_root_for_profile(profile)
         if not model_root:
             raise PieRuntimeError("PIE_MODEL_ROOT is not configured.")
 
@@ -122,6 +125,10 @@ class PieRunner:
 
         # Fall back to the directory path so deployments can point PIE directly at an unpacked model directory.
         return str(root)
+
+    def _model_root_for_profile(self, profile: str | None = None) -> str | None:
+        path = self.resource_registry.pie_model_path(profile)
+        return str(path) if path is not None else None
 
     def _parse_output(
         self,

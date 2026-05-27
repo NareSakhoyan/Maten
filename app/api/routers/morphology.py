@@ -5,8 +5,9 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
-from app.api.deps import get_current_user, get_db_session
+from app.api.deps import get_db_session, require_admin_user
 from app.db.models import JobKind
+from app.services.backpressure_service import BackpressureLimitError, get_backpressure_service
 from app.services.job_orchestrator import get_job_orchestrator
 from app.schemas.morphology import MorphologyRunCreateRequest, MorphologyRunRead, MorphologyRunStartResponse
 from app.services.auth_service import AuthenticatedUser
@@ -26,6 +27,7 @@ def start_morphology_run_or_raise(
     long_running_job_service: LongRunningJobService,
 ) -> MorphologyRunStartResponse:
     try:
+        get_backpressure_service().ensure_user_capacity(session, user_id=current_user.user_id)
         run = morphology_service.create_run(
             session,
             user_id=current_user.user_id,
@@ -46,6 +48,8 @@ def start_morphology_run_or_raise(
             ) from exc
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    except BackpressureLimitError as exc:
+        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=str(exc)) from exc
 
     job = long_running_job_service.build_job_read(run, session=session)
     return MorphologyRunStartResponse(
@@ -58,7 +62,7 @@ def start_morphology_run_or_raise(
 @router.post("/runs", response_model=MorphologyRunStartResponse, status_code=status.HTTP_201_CREATED)
 async def create_morphology_run(
     request: MorphologyRunCreateRequest,
-    current_user: AuthenticatedUser = Depends(get_current_user),
+    current_user: AuthenticatedUser = Depends(require_admin_user),
     session: Session = Depends(get_db_session),
     morphology_service: MorphologyService = Depends(get_morphology_service),
     long_running_job_service: LongRunningJobService = Depends(get_long_running_job_service),
@@ -75,7 +79,7 @@ async def create_morphology_run(
 @router.get("/runs/{run_id}", response_model=MorphologyRunRead)
 async def get_morphology_run(
     run_id: UUID,
-    current_user: AuthenticatedUser = Depends(get_current_user),
+    current_user: AuthenticatedUser = Depends(require_admin_user),
     session: Session = Depends(get_db_session),
     morphology_service: MorphologyService = Depends(get_morphology_service),
 ) -> MorphologyRunRead:

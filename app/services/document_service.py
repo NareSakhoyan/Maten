@@ -95,7 +95,7 @@ class DocumentService:
             session,
             job_kind=JobKind.INGESTION,
             job=job,
-            stage_code="queued",
+            stage_code="uploaded",
             progress_percent=0,
         )
         session.commit()

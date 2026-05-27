@@ -10,7 +10,7 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.api.deps import get_current_user, get_db_session
+from app.api.deps import get_current_user, get_db_session, require_admin_user
 from app.core.config import get_settings
 from app.db.models import DocumentPage, JobKind
 from app.schemas.document import (
@@ -25,12 +25,13 @@ from app.schemas.morphology import DocumentMorphologySettingsResponse, Morpholog
 from app.schemas.page import DocumentPageListResponse
 from app.schemas.reference import ReferenceStatusFilter
 from app.schemas.word import (
-    DocumentNayiriLookupRunStartResponse,
-    DocumentNayiriLookupSummary,
+    DocumentTrustedExternalLookupRunStartResponse,
+    DocumentTrustedExternalLookupSummary,
     DocumentWordCandidateListResponse,
     SourceWordStatusView,
 )
 from app.services.auth_service import AuthenticatedUser
+from app.services.backpressure_service import BackpressureLimitError, BackpressureService, get_backpressure_service
 from app.services.document_service import DocumentService, get_document_service
 from app.services.document_workflow_service import DocumentWorkflowService, get_document_workflow_service
 from app.services.ingestion_error_service import get_ingestion_error_service
@@ -42,7 +43,10 @@ from app.services.lexicon_index_rebuild_service import (
     LexiconIndexRebuildService,
     get_lexicon_index_rebuild_service,
 )
-from app.services.document_nayiri_lookup_service import DocumentNayiriLookupService, get_document_nayiri_lookup_service
+from app.services.document_nayiri_lookup_service import (
+    DocumentTrustedExternalLookupService,
+    get_document_trusted_external_lookup_service,
+)
 from app.services.document_trusted_external_service import (
     DocumentTrustedExternalService,
     get_document_trusted_external_service,
@@ -97,6 +101,7 @@ async def upload_document(
     session: Session = Depends(get_db_session),
     document_service: DocumentService = Depends(get_document_service),
     ingestion_job_service: IngestionJobService = Depends(get_ingestion_job_service),
+    backpressure_service: BackpressureService = Depends(get_backpressure_service),
 ) -> DocumentStartResponse:
     filename = file.filename or "upload.bin"
     file_bytes = await file.read()
@@ -114,6 +119,12 @@ async def upload_document(
         mime_type = detect_mime_type(filename, file_bytes, file.content_type)
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+
+    try:
+        backpressure_service.ensure_user_capacity(session, user_id=current_user.user_id)
+        backpressure_service.ensure_ocr_capacity(session)
+    except BackpressureLimitError as exc:
+        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=str(exc)) from exc
 
     document, job = document_service.create_document_and_job(
         session,
@@ -213,7 +224,7 @@ async def list_documents(
 
 
 @router.get("/{document_id}", response_model=DocumentRead)
-async def get_document(
+def get_document(
     document_id: UUID,
     current_user: AuthenticatedUser = Depends(get_current_user),
     session: Session = Depends(get_db_session),
@@ -226,11 +237,11 @@ async def get_document(
     )
     if document is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found.")
-    return document_service.build_document_read(session, document, include_workspace_summary=True)
+    return document_service.build_document_read(session, document)
 
 
 @router.get("/{document_id}/workflow", response_model=DocumentWorkflowRead)
-async def get_document_workflow(
+def get_document_workflow(
     document_id: UUID,
     current_user: AuthenticatedUser = Depends(get_current_user),
     session: Session = Depends(get_db_session),
@@ -247,7 +258,7 @@ async def get_document_workflow(
 
 
 @router.get("/{document_id}/pages", response_model=DocumentPageListResponse)
-async def list_document_pages(
+def list_document_pages(
     document_id: UUID,
     limit: int = Query(default=50, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
@@ -274,7 +285,7 @@ async def list_document_pages(
 
 
 @router.get("/{document_id}/pages/{page_id}/image")
-async def get_document_page_image(
+def get_document_page_image(
     document_id: UUID,
     page_id: UUID,
     current_user: AuthenticatedUser = Depends(get_current_user),
@@ -310,7 +321,7 @@ async def get_document_page_image(
 
 
 @router.get("/{document_id}/word-candidates", response_model=DocumentWordCandidateListResponse)
-async def list_document_word_candidates(
+def list_document_word_candidates(
     document_id: UUID,
     search: str | None = Query(default=None),
     word_filter: Annotated[str | None, Query(alias="filter")] = None,
@@ -318,7 +329,7 @@ async def list_document_word_candidates(
     reference_status: Annotated[ReferenceStatusFilter | None, Query()] = None,
     limit: int = Query(default=20, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
-    current_user: AuthenticatedUser = Depends(get_current_user),
+    current_user: AuthenticatedUser = Depends(require_admin_user),
     session: Session = Depends(get_db_session),
     document_service: DocumentService = Depends(get_document_service),
     source_word_review_service: SourceWordReviewService = Depends(get_source_word_review_service),
@@ -348,14 +359,15 @@ async def list_document_word_candidates(
     return DocumentWordCandidateListResponse(items=items, total=total, limit=limit, offset=offset)
 
 
-@router.get("/{document_id}/trusted-lookups/nayiri/summary", response_model=DocumentNayiriLookupSummary)
-async def get_document_nayiri_lookup_summary(
+@router.get("/{document_id}/trusted-lookups/external/summary", response_model=DocumentTrustedExternalLookupSummary)
+@router.get("/{document_id}/trusted-lookups/nayiri/summary", response_model=DocumentTrustedExternalLookupSummary)
+def get_document_trusted_external_lookup_summary(
     document_id: UUID,
-    current_user: AuthenticatedUser = Depends(get_current_user),
+    current_user: AuthenticatedUser = Depends(require_admin_user),
     session: Session = Depends(get_db_session),
     document_service: DocumentService = Depends(get_document_service),
     document_trusted_external_service: DocumentTrustedExternalService = Depends(get_document_trusted_external_service),
-) -> DocumentNayiriLookupSummary:
+) -> DocumentTrustedExternalLookupSummary:
     document = document_service.get_user_document(
         session,
         user_id=current_user.user_id,
@@ -368,22 +380,29 @@ async def get_document_nayiri_lookup_summary(
         user_id=current_user.user_id,
         document_id=document_id,
     )
-    return DocumentNayiriLookupSummary(**summary)
+    return DocumentTrustedExternalLookupSummary(**summary)
 
 
 @router.post(
-    "/{document_id}/trusted-lookups/nayiri/run",
-    response_model=DocumentNayiriLookupRunStartResponse,
+    "/{document_id}/trusted-lookups/external/run",
+    response_model=DocumentTrustedExternalLookupRunStartResponse,
     status_code=status.HTTP_202_ACCEPTED,
 )
-async def start_document_nayiri_lookup_run(
+@router.post(
+    "/{document_id}/trusted-lookups/nayiri/run",
+    response_model=DocumentTrustedExternalLookupRunStartResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+def start_document_trusted_external_lookup_run(
     document_id: UUID,
-    current_user: AuthenticatedUser = Depends(get_current_user),
+    current_user: AuthenticatedUser = Depends(require_admin_user),
     session: Session = Depends(get_db_session),
     document_service: DocumentService = Depends(get_document_service),
-    document_nayiri_lookup_service: DocumentNayiriLookupService = Depends(get_document_nayiri_lookup_service),
+    document_trusted_external_lookup_service: DocumentTrustedExternalLookupService = Depends(
+        get_document_trusted_external_lookup_service
+    ),
     long_running_job_service: LongRunningJobService = Depends(get_long_running_job_service),
-) -> DocumentNayiriLookupRunStartResponse:
+) -> DocumentTrustedExternalLookupRunStartResponse:
     document = document_service.get_user_document(
         session,
         user_id=current_user.user_id,
@@ -393,27 +412,29 @@ async def start_document_nayiri_lookup_run(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found.")
 
     try:
-        run = document_nayiri_lookup_service.start_document_run(
+        run = document_trusted_external_lookup_service.start_document_run(
             session,
             user_id=current_user.user_id,
             document_id=document_id,
         )
+    except BackpressureLimitError as exc:
+        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
 
     job = long_running_job_service.build_job_read(run, session=session)
-    return DocumentNayiriLookupRunStartResponse(
-        message="Nayiri lookup queued for this document.",
+    return DocumentTrustedExternalLookupRunStartResponse(
+        message="Trusted reference lookup queued for this document.",
         run_id=run.id,
         job_id=job.id,
     )
 
 
 @router.post("/{document_id}/rebuild-index", response_model=LexiconIndexRebuildResponse)
-async def rebuild_document_lexicon_index(
+def rebuild_document_lexicon_index(
     document_id: UUID,
     background: bool = Query(default=False),
-    current_user: AuthenticatedUser = Depends(get_current_user),
+    current_user: AuthenticatedUser = Depends(require_admin_user),
     session: Session = Depends(get_db_session),
     document_service: DocumentService = Depends(get_document_service),
     rebuild_service: LexiconIndexRebuildService = Depends(get_lexicon_index_rebuild_service),
@@ -452,7 +473,7 @@ async def rebuild_document_lexicon_index(
 
 
 @router.get("/{document_id}/morphology-summary", response_model=MorphologySummaryResponse)
-async def get_document_morphology_summary(
+def get_document_morphology_summary(
     document_id: UUID,
     current_user: AuthenticatedUser = Depends(get_current_user),
     session: Session = Depends(get_db_session),
@@ -474,10 +495,10 @@ async def get_document_morphology_summary(
 
 
 @router.patch("/{document_id}/morphology-settings", response_model=DocumentMorphologySettingsResponse)
-async def update_document_morphology_settings(
+def update_document_morphology_settings(
     document_id: UUID,
     request: MorphologySettingsUpdateRequest,
-    current_user: AuthenticatedUser = Depends(get_current_user),
+    current_user: AuthenticatedUser = Depends(require_admin_user),
     session: Session = Depends(get_db_session),
     document_service: DocumentService = Depends(get_document_service),
     morphology_service: MorphologyService = Depends(get_morphology_service),

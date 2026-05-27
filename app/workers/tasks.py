@@ -103,29 +103,38 @@ def rebuild_lexicon_index_user_task(user_id: str) -> dict[str, object]:
     return {"user_id": user_id, "document_count": document_count}
 
 
-@celery_app.task(name="app.workers.tasks.process_document_nayiri_lookup_run")
-def process_document_nayiri_lookup_run(run_id: str) -> dict[str, str]:
-    from app.services.document_nayiri_lookup_service import get_document_nayiri_lookup_service
+def _process_document_trusted_external_lookup(run_id: str) -> dict[str, str]:
+    from app.services.document_nayiri_lookup_service import get_document_trusted_external_lookup_service
 
-    logger.info("Starting document Nayiri lookup run task run_id=%s", run_id)
-    lookup_service = get_document_nayiri_lookup_service()
+    logger.info("Starting document trusted external lookup task run_id=%s", run_id)
+    lookup_service = get_document_trusted_external_lookup_service()
     try:
         lookup_service.process_run(run_id)
     except ValueError as exc:
         if "was not found" in str(exc):
             logger.warning(
-                "Skipping stale document Nayiri lookup task run_id=%s reason=%s",
+                "Skipping stale document trusted external lookup task run_id=%s reason=%s",
                 run_id,
                 str(exc),
             )
             return {"run_id": run_id, "status": "skipped_missing_run"}
-        logger.exception("Document Nayiri lookup run task failed run_id=%s", run_id)
+        logger.exception("Document trusted external lookup task failed run_id=%s", run_id)
         raise
     except Exception:
-        logger.exception("Document Nayiri lookup run task failed run_id=%s", run_id)
+        logger.exception("Document trusted external lookup task failed run_id=%s", run_id)
         raise
-    logger.info("Finished document Nayiri lookup run task run_id=%s", run_id)
+    logger.info("Finished document trusted external lookup task run_id=%s", run_id)
     return {"run_id": run_id, "status": "completed"}
+
+
+@celery_app.task(name="app.workers.tasks.process_document_trusted_external_lookup_run")
+def process_document_trusted_external_lookup_run(run_id: str) -> dict[str, str]:
+    return _process_document_trusted_external_lookup(run_id)
+
+
+@celery_app.task(name="app.workers.tasks.process_document_nayiri_lookup_run")
+def process_document_nayiri_lookup_run(run_id: str) -> dict[str, str]:
+    return _process_document_trusted_external_lookup(run_id)
 
 
 @celery_app.task(name="app.workers.tasks.process_morphology_run")
@@ -138,4 +147,19 @@ def process_morphology_run(run_id: str) -> dict[str, str]:
         logger.exception("Morphology run task failed run_id=%s", run_id)
         raise
     logger.info("Finished morphology run task run_id=%s", run_id)
+    return {"run_id": run_id, "status": "completed"}
+
+
+@celery_app.task(name="app.workers.tasks.process_document_discovery_build")
+def process_document_discovery_build(run_id: str) -> dict[str, str]:
+    from app.services.discovery.discovery_candidate_service import get_discovery_candidate_service
+
+    logger.info("Starting document discovery build task run_id=%s", run_id)
+    discovery_service = get_discovery_candidate_service()
+    try:
+        discovery_service.process_run(run_id)
+    except Exception:
+        logger.exception("Document discovery build task failed run_id=%s", run_id)
+        raise
+    logger.info("Finished document discovery build task run_id=%s", run_id)
     return {"run_id": run_id, "status": "completed"}

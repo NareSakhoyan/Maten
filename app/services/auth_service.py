@@ -6,7 +6,7 @@ import hashlib
 import logging
 from threading import Lock
 from time import monotonic
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID
 
 from httpx import Client as HTTPXClient
@@ -17,11 +17,15 @@ from supabase.lib.client_options import SyncClientOptions
 from app.core.config import Settings, get_settings
 
 
+UserRole = Literal["admin", "linguist"]
+
+
 @dataclass(frozen=True, slots=True)
 class AuthenticatedUser:
     user_id: UUID
     access_token: str
     email: str | None = None
+    role: UserRole = "linguist"
 
 
 logger = logging.getLogger(__name__)
@@ -33,6 +37,33 @@ def _value_from_object(value: Any, key: str) -> Any:
     if isinstance(value, dict):
         return value.get(key)
     return getattr(value, key, None)
+
+
+def _normalize_role(value: Any) -> UserRole | None:
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"admin", "administrator"}:
+            return "admin"
+        if normalized == "linguist":
+            return "linguist"
+    return None
+
+
+def _resolve_user_role(user_payload: Any) -> UserRole:
+    app_metadata = _value_from_object(user_payload, "app_metadata")
+    user_metadata = _value_from_object(user_payload, "user_metadata")
+    metadata_candidates = [app_metadata, user_metadata]
+
+    for metadata in metadata_candidates:
+        role = _normalize_role(_value_from_object(metadata, "role"))
+        if role is not None:
+            return role
+
+        roles = _value_from_object(metadata, "roles")
+        if isinstance(roles, (list, tuple, set)) and any(_normalize_role(item) == "admin" for item in roles):
+            return "admin"
+
+    return "linguist"
 
 
 @lru_cache(maxsize=1)
@@ -56,7 +87,7 @@ class AuthService:
         self.settings = settings or get_settings()
         self.client = client or _build_supabase_auth_client(self.settings)
         self._cache_ttl_seconds = self.settings.supabase_auth_cache_ttl_seconds
-        self._verification_cache: dict[str, tuple[float, UUID, str | None]] = {}
+        self._verification_cache: dict[str, tuple[float, UUID, str | None, UserRole]] = {}
         self._cache_lock = Lock()
 
     def _cache_key(self, access_token: str) -> str:
@@ -71,11 +102,11 @@ class AuthService:
             cached = self._verification_cache.get(cache_key)
             if cached is None:
                 return None
-            expires_at, user_id, email = cached
+            expires_at, user_id, email, role = cached
             if expires_at <= now:
                 self._verification_cache.pop(cache_key, None)
                 return None
-        return AuthenticatedUser(user_id=user_id, access_token=access_token, email=email)
+        return AuthenticatedUser(user_id=user_id, access_token=access_token, email=email, role=role)
 
     def _store_cached_user(self, access_token: str, authenticated_user: AuthenticatedUser) -> None:
         if self._cache_ttl_seconds <= 0:
@@ -87,6 +118,7 @@ class AuthService:
                 expires_at,
                 authenticated_user.user_id,
                 authenticated_user.email,
+                authenticated_user.role,
             )
 
     def verify_access_token(self, access_token: str) -> AuthenticatedUser:
@@ -118,10 +150,12 @@ class AuthService:
             raise ValueError("Token verification failed.")
 
         email = _value_from_object(user_payload, "email")
+        role = _resolve_user_role(user_payload)
         authenticated_user = AuthenticatedUser(
             user_id=UUID(str(user_id)),
             access_token=access_token,
             email=email,
+            role=role,
         )
         self._store_cached_user(access_token, authenticated_user)
         elapsed_ms = int((monotonic() - started_at) * 1000)

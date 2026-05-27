@@ -3,14 +3,22 @@ from __future__ import annotations
 import asyncio
 from uuid import UUID, uuid4
 
-from sqlalchemy import delete
+from sqlalchemy import delete, select
 
 from app.api.routers.documents import get_document, list_document_word_candidates
 from app.api.routers.reference_sources import get_reference_source, list_reference_source_word_candidates
 from app.db.models import ReferenceMatchingDirection
 from app.api.routers.words import check_word, get_word_evidence, search_words
 from app.db.models import ReferenceMatchType
-from app.db.models import Document, DocumentPage, DocumentStatus, LexemeStatus, Occurrence
+from app.db.models import (
+    Document,
+    DocumentPage,
+    DocumentStatus,
+    LexemeStatus,
+    MorphologyAnalysis,
+    MorphologyAnalysisStatus,
+    Occurrence,
+)
 from app.schemas.lexeme import LexemeCreateRequest
 from app.schemas.reference import ReferenceMatchRunCreateRequest, ReferenceSourceCreateRequest, ReferenceStatusFilter
 from app.schemas.word import (
@@ -423,6 +431,62 @@ def test_source_first_reference_status_overrides_direct_internal_match(db_sessio
     assert response.source.unmatched_entry_count == 1
     assert response.total == 1
     assert response.items[0].normalized_form == "հայաստան"
+
+
+def test_word_search_finds_morphology_lemma_matches(db_session) -> None:
+    workspace = _seed_workspace(db_session)
+    document = workspace["document"]
+    occurrence = db_session.scalars(
+        select(Occurrence).where(
+            Occurrence.document_id == document.id,
+            Occurrence.normalized_token == "բառ",
+        )
+    ).first()
+    assert occurrence is not None
+    db_session.add(
+        MorphologyAnalysis(
+            user_id=str(PRIMARY_USER_ID),
+            occurrence_id=occurrence.id,
+            document_id=document.id,
+            page_id=occurrence.page_id,
+            source_type="imported_book",
+            token_surface=occurrence.token,
+            token_normalized=occurrence.normalized_token,
+            lemma="Գալ",
+            lemma_normalized="գալ",
+            pos="VERB",
+            analyzer_provider="pie",
+            analyzer_model_key="hye",
+            analysis_status=MorphologyAnalysisStatus.COMPLETED,
+        )
+    )
+    db_session.commit()
+
+    response = asyncio.run(
+        search_words(
+            q="գալ",
+            mode=WordSearchMode.NORMALIZED,
+            include_categories=[WordSearchCategory.IMPORTED_BOOKS],
+            limit_per_category=20,
+            current_user=_current_user(),
+            session=db_session,
+            word_search_service=WordSearchService(),
+        )
+    )
+
+    books_group = next(group for group in response.groups if group.category is WordSearchCategory.IMPORTED_BOOKS)
+    assert books_group.total >= 1
+    assert any(item.normalized_form == "բառ" and item.matched_form == "Գալ" for item in books_group.items)
+
+    check_response = asyncio.run(
+        check_word(
+            q="գալ",
+            current_user=_current_user(),
+            session=db_session,
+            word_search_service=WordSearchService(),
+        )
+    )
+    assert check_response.found_in_imported_books is True
 
 
 def test_global_word_search_and_quick_check(db_session) -> None:

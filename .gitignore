@@ -10,7 +10,12 @@ __pycache__/
 # Virtual environments
 .venv/
 venv/
+.pie-venv/
 backend/.venv/
+
+# Local runtime data and generated reports
+data/
+benchmark-reports/
 
 # Environment files
 .env

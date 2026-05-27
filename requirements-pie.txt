@@ -1,0 +1,18 @@
+# Runtime pins for the legacy nlp-pie CLI on the backend Python image.
+#
+# nlp-pie 0.3.8 declares very old dependency caps that no longer resolve on
+# modern Python. Install these compatible runtime packages first, then install
+# nlp-pie itself with --no-deps in the Dockerfile.
+click==7.1.2
+gensim==4.4.0
+JSON-minify==0.3.0
+lxml==6.1.1
+numpy==1.26.4
+PyYAML==6.0.3
+scikit-learn==1.7.2
+scipy==1.15.3
+terminaltables==3.1.10
+termcolor==3.3.0
+torch==2.12.0+cpu
+tqdm==4.67.3
+typing_extensions==4.15.0

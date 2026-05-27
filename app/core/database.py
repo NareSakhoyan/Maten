@@ -14,7 +14,8 @@ settings = get_settings()
 engine = create_engine(
     settings.database_url,
     future=True,
-    pool_pre_ping=True,
+    pool_pre_ping=settings.database_pool_pre_ping,
+    pool_recycle=settings.database_pool_recycle_seconds,
 )
 
 SessionLocal = sessionmaker(

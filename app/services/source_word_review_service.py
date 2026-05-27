@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import defaultdict
 from uuid import UUID
 
 from sqlalchemy import func, or_, select
@@ -71,15 +72,21 @@ class SourceWordReviewService:
             )
         )
 
-        total = session.scalar(select(func.count()).select_from(group_subquery).where(*filters)) or 0
         rows = session.execute(
-            select(group_subquery)
+            select(group_subquery, func.count().over().label("total_count"))
             .where(*filters)
             .order_by(group_subquery.c.occurrence_count.desc(), group_subquery.c.normalized_form.asc())
             .limit(limit)
             .offset(offset)
         ).all()
+        if rows:
+            total = rows[0].total_count
+        else:
+            total = session.scalar(select(func.count()).select_from(group_subquery).where(*filters)) or 0
         normalized_forms = [row.normalized_form for row in rows]
+        if not normalized_forms:
+            return [], total
+
         reference_summary_map = self.reference_matching_service.group_summary_map(
             session,
             user_id=user_id,
@@ -89,21 +96,23 @@ class SourceWordReviewService:
             session,
             normalized_forms=normalized_forms,
         )
+        sample_map = self._sample_data_for_document_groups(
+            session,
+            user_id=user_id,
+            document_id=document.id,
+            normalized_forms=normalized_forms,
+        )
+        sample_pages_map = self._sample_pages_for_document_groups(
+            session,
+            user_id=user_id,
+            document_id=document.id,
+            normalized_forms=normalized_forms,
+        )
 
         items: list[DocumentWordCandidateSummary] = []
         for row in rows:
-            sample_tokens, sample_contexts, _ = self.lexicon_service._load_group_samples(  # noqa: SLF001
-                session,
-                user_id=user_id,
-                normalized_form=row.normalized_form,
-                document_id=document.id,
-            )
-            sample_pages = self._sample_pages_for_document_group(
-                session,
-                user_id=user_id,
-                document_id=document.id,
-                normalized_form=row.normalized_form,
-            )
+            sample_tokens, sample_contexts = sample_map.get(row.normalized_form, ([], []))
+            sample_pages = sample_pages_map.get(row.normalized_form, [])
             dominant_script_type = OccurrenceScriptType(row.dominant_script_type)
             reference_summary = reference_summary_map[row.normalized_form]
             nayiri_snapshot = nayiri_status_map.get(
@@ -171,20 +180,14 @@ class SourceWordReviewService:
             user_id=user_id,
             document_id=document_id,
         )
-        nayiri_map = self.document_trusted_external_service.nayiri_status_map(
+        nayiri_found_forms = self.document_trusted_external_service.nayiri_found_normalized_forms(
             session,
             normalized_forms=forms,
         )
-        nayiri_found_forms = [
-            form
-            for form, snapshot in nayiri_map.items()
-            if snapshot.status is DocumentTrustedExternalStatus.FOUND
-        ]
-        nayiri_unmatched_forms = [
-            form
-            for form, snapshot in nayiri_map.items()
-            if snapshot.status is DocumentTrustedExternalStatus.NOT_FOUND
-        ]
+        nayiri_unmatched_forms = self.document_trusted_external_service.nayiri_not_found_normalized_forms(
+            session,
+            normalized_forms=forms,
+        )
 
         if reference_status is ReferenceStatusFilter.MATCHED:
             matched_clauses = []
@@ -394,6 +397,119 @@ class SourceWordReviewService:
                 .limit(5)
             )
         )
+
+    @staticmethod
+    def _sample_data_for_document_groups(
+        session: Session,
+        *,
+        user_id: UUID,
+        document_id: UUID,
+        normalized_forms: list[str],
+    ) -> dict[str, tuple[list[str], list[str]]]:
+        if not normalized_forms:
+            return {}
+
+        sample_rank = (
+            func.row_number()
+            .over(
+                partition_by=Occurrence.normalized_token,
+                order_by=(
+                    Occurrence.page_number.asc(),
+                    Occurrence.char_start.asc().nullsfirst(),
+                    Occurrence.created_at.asc(),
+                ),
+            )
+            .label("sample_rank")
+        )
+        ranked_samples = (
+            select(
+                Occurrence.normalized_token.label("normalized_form"),
+                Occurrence.token.label("token"),
+                Occurrence.context_snippet.label("context_snippet"),
+                sample_rank,
+            )
+            .join(Document, Occurrence.document_id == Document.id)
+            .where(
+                Document.user_id == user_id,
+                Occurrence.document_id == document_id,
+                Occurrence.normalized_token.in_(normalized_forms),
+            )
+            .subquery()
+        )
+        rows = session.execute(
+            select(
+                ranked_samples.c.normalized_form,
+                ranked_samples.c.token,
+                ranked_samples.c.context_snippet,
+            )
+            .where(ranked_samples.c.sample_rank <= 100)
+            .order_by(ranked_samples.c.normalized_form.asc(), ranked_samples.c.sample_rank.asc())
+        ).all()
+
+        samples: dict[str, tuple[list[str], list[str]]] = {}
+        seen_tokens: defaultdict[str, set[str]] = defaultdict(set)
+        seen_contexts: defaultdict[str, set[str]] = defaultdict(set)
+        for normalized_form, token, context_snippet in rows:
+            sample_tokens, sample_contexts = samples.setdefault(normalized_form, ([], []))
+            if token not in seen_tokens[normalized_form] and len(sample_tokens) < 5:
+                seen_tokens[normalized_form].add(token)
+                sample_tokens.append(token)
+            if context_snippet not in seen_contexts[normalized_form] and len(sample_contexts) < 5:
+                seen_contexts[normalized_form].add(context_snippet)
+                sample_contexts.append(context_snippet)
+        return samples
+
+    @staticmethod
+    def _sample_pages_for_document_groups(
+        session: Session,
+        *,
+        user_id: UUID,
+        document_id: UUID,
+        normalized_forms: list[str],
+    ) -> dict[str, list[int]]:
+        if not normalized_forms:
+            return {}
+
+        distinct_pages = (
+            select(
+                Occurrence.normalized_token.label("normalized_form"),
+                Occurrence.page_number.label("page_number"),
+            )
+            .join(Document, Occurrence.document_id == Document.id)
+            .where(
+                Document.user_id == user_id,
+                Occurrence.document_id == document_id,
+                Occurrence.normalized_token.in_(normalized_forms),
+            )
+            .distinct()
+            .subquery()
+        )
+        page_rank = (
+            func.row_number()
+            .over(
+                partition_by=distinct_pages.c.normalized_form,
+                order_by=distinct_pages.c.page_number.asc(),
+            )
+            .label("page_rank")
+        )
+        ranked_pages = (
+            select(
+                distinct_pages.c.normalized_form,
+                distinct_pages.c.page_number,
+                page_rank,
+            )
+            .subquery()
+        )
+        rows = session.execute(
+            select(ranked_pages.c.normalized_form, ranked_pages.c.page_number)
+            .where(ranked_pages.c.page_rank <= 5)
+            .order_by(ranked_pages.c.normalized_form.asc(), ranked_pages.c.page_number.asc())
+        ).all()
+
+        pages: defaultdict[str, list[int]] = defaultdict(list)
+        for normalized_form, page_number in rows:
+            pages[normalized_form].append(page_number)
+        return dict(pages)
 
     @staticmethod
     def _to_reference_source_candidate(

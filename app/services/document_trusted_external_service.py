@@ -4,8 +4,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from uuid import UUID
 
-from sqlalchemy import func, select
-from sqlalchemy.orm import Session, selectinload
+from sqlalchemy import and_, exists, func, select
+from sqlalchemy.orm import Session
 
 from app.db.models import (
     Document,
@@ -22,7 +22,7 @@ from app.schemas.word import (
     TrustedExternalLookupStatus,
 )
 from app.utils.text_normalization import normalize_token
-from app.services.external_lookup_service import ExternalLookupService, get_external_lookup_service
+from app.services.external_lookup_service import ExternalLookupService, _as_utc, get_external_lookup_service
 
 
 NAYIRI_PROVIDER_KEY = "nayiri_web"
@@ -75,20 +75,6 @@ class DocumentTrustedExternalService:
         if not normalized_forms:
             return {}
 
-        if not self.external_lookup_service.settings.external_lookup_enabled:
-            unavailable = NayiriLookupSnapshot(
-                status=DocumentTrustedExternalStatus.UNAVAILABLE,
-                provider_display_name="Nayiri",
-            )
-            return {form: unavailable for form in normalized_forms}
-
-        if NAYIRI_PROVIDER_KEY not in self.external_lookup_service.providers:
-            unavailable = NayiriLookupSnapshot(
-                status=DocumentTrustedExternalStatus.UNAVAILABLE,
-                provider_display_name="Nayiri",
-            )
-            return {form: unavailable for form in normalized_forms}
-
         provider_row = session.scalar(
             select(ExternalProvider).where(ExternalProvider.key == NAYIRI_PROVIDER_KEY)
         )
@@ -108,25 +94,14 @@ class DocumentTrustedExternalService:
         provider_id = provider_row.id
         provider_display_name = provider_row.display_name
 
-        latest_cache_subquery = (
-            select(
-                ExternalLookupCache.normalized_query.label("normalized_query"),
-                func.max(ExternalLookupCache.created_at).label("latest_created_at"),
-            )
-            .where(
-                ExternalLookupCache.provider_id == provider_id,
-                ExternalLookupCache.user_id.is_(None),
-                ExternalLookupCache.search_mode == ExternalLookupSearchMode.NORMALIZED,
-                ExternalLookupCache.normalized_query.in_(normalized_forms),
-            )
-            .group_by(ExternalLookupCache.normalized_query)
-            .subquery()
+        latest_cache_subquery = self._latest_cache_subquery(
+            provider_id=provider_id,
+            normalized_forms=normalized_forms,
         )
 
         cache_by_form: dict[str, ExternalLookupCache] = {}
         cache_rows = session.scalars(
             select(ExternalLookupCache)
-            .options(selectinload(ExternalLookupCache.results))
             .join(
                 latest_cache_subquery,
                 (ExternalLookupCache.normalized_query == latest_cache_subquery.c.normalized_query)
@@ -141,14 +116,110 @@ class DocumentTrustedExternalService:
         for cache_row in cache_rows:
             cache_by_form[cache_row.normalized_query] = cache_row
 
+        cache_ids = [cache_row.id for cache_row in cache_rows]
+        match_count_by_cache_id = self._match_count_by_cache_id(session, cache_ids=cache_ids)
+        first_result_by_cache_id = self._first_result_by_cache_id(session, cache_ids=cache_ids)
+
         snapshots: dict[str, NayiriLookupSnapshot] = {}
         for normalized_form in normalized_forms:
             cache_row = cache_by_form.get(normalized_form)
+            first_result = first_result_by_cache_id.get(cache_row.id) if cache_row is not None else None
+            match_count = match_count_by_cache_id.get(cache_row.id, 0) if cache_row is not None else 0
             snapshots[normalized_form] = self._snapshot_from_cache(
                 cache_row,
                 provider_display_name=provider_display_name,
+                first_result=first_result,
+                match_count=match_count,
             )
         return snapshots
+
+    def nayiri_found_normalized_forms(
+        self,
+        session: Session,
+        *,
+        normalized_forms: list[str],
+    ) -> list[str]:
+        if not normalized_forms:
+            return []
+        provider_row = session.scalar(
+            select(ExternalProvider).where(ExternalProvider.key == NAYIRI_PROVIDER_KEY)
+        )
+        if provider_row is None or not provider_row.is_active:
+            return []
+
+        latest_cache_subquery = self._latest_cache_subquery(
+            provider_id=provider_row.id,
+            normalized_forms=normalized_forms,
+        )
+        now = _as_utc(self.external_lookup_service.now_fn())
+        return list(
+            session.scalars(
+                select(ExternalLookupCache.normalized_query)
+                .join(
+                    latest_cache_subquery,
+                    (ExternalLookupCache.normalized_query == latest_cache_subquery.c.normalized_query)
+                    & (ExternalLookupCache.created_at == latest_cache_subquery.c.latest_created_at),
+                )
+                .where(
+                    ExternalLookupCache.provider_id == provider_row.id,
+                    ExternalLookupCache.user_id.is_(None),
+                    ExternalLookupCache.search_mode == ExternalLookupSearchMode.NORMALIZED,
+                    ExternalLookupCache.status == ExternalLookupStatus.COMPLETED,
+                    (ExternalLookupCache.expires_at.is_(None) | (ExternalLookupCache.expires_at > now)),
+                    exists(
+                        select(ExternalLookupResult.id).where(
+                            ExternalLookupResult.cache_id == ExternalLookupCache.id
+                        )
+                    ),
+                )
+                .distinct()
+                .order_by(ExternalLookupCache.normalized_query.asc())
+            ).all()
+        )
+
+    def nayiri_not_found_normalized_forms(
+        self,
+        session: Session,
+        *,
+        normalized_forms: list[str],
+    ) -> list[str]:
+        if not normalized_forms:
+            return []
+        provider_row = session.scalar(
+            select(ExternalProvider).where(ExternalProvider.key == NAYIRI_PROVIDER_KEY)
+        )
+        if provider_row is None or not provider_row.is_active:
+            return []
+
+        latest_cache_subquery = self._latest_cache_subquery(
+            provider_id=provider_row.id,
+            normalized_forms=normalized_forms,
+        )
+        now = _as_utc(self.external_lookup_service.now_fn())
+        return list(
+            session.scalars(
+                select(ExternalLookupCache.normalized_query)
+                .join(
+                    latest_cache_subquery,
+                    (ExternalLookupCache.normalized_query == latest_cache_subquery.c.normalized_query)
+                    & (ExternalLookupCache.created_at == latest_cache_subquery.c.latest_created_at),
+                )
+                .where(
+                    ExternalLookupCache.provider_id == provider_row.id,
+                    ExternalLookupCache.user_id.is_(None),
+                    ExternalLookupCache.search_mode == ExternalLookupSearchMode.NORMALIZED,
+                    ExternalLookupCache.status == ExternalLookupStatus.COMPLETED,
+                    (ExternalLookupCache.expires_at.is_(None) | (ExternalLookupCache.expires_at > now)),
+                    ~exists(
+                        select(ExternalLookupResult.id).where(
+                            ExternalLookupResult.cache_id == ExternalLookupCache.id
+                        )
+                    ),
+                )
+                .distinct()
+                .order_by(ExternalLookupCache.normalized_query.asc())
+            ).all()
+        )
 
     def summarize_document(
         self,
@@ -157,24 +228,95 @@ class DocumentTrustedExternalService:
         user_id: UUID,
         document_id: UUID,
     ) -> dict[str, int]:
-        forms = self.list_document_normalized_forms(session, user_id=user_id, document_id=document_id)
-        status_map = self.nayiri_status_map(session, normalized_forms=forms)
+        provider_id = select(ExternalProvider.id).where(ExternalProvider.key == NAYIRI_PROVIDER_KEY).scalar_subquery()
+        provider_is_active = (
+            select(ExternalProvider.is_active).where(ExternalProvider.key == NAYIRI_PROVIDER_KEY).scalar_subquery()
+        )
+        forms_subquery = (
+            select(Occurrence.normalized_token.label("normalized_form"))
+            .join(Document, Occurrence.document_id == Document.id)
+            .where(
+                Document.user_id == user_id,
+                Occurrence.document_id == document_id,
+            )
+            .distinct()
+            .subquery()
+        )
+        latest_cache_subquery = (
+            select(
+                ExternalLookupCache.normalized_query.label("normalized_query"),
+                func.max(ExternalLookupCache.created_at).label("latest_created_at"),
+            )
+            .join(forms_subquery, ExternalLookupCache.normalized_query == forms_subquery.c.normalized_form)
+            .where(
+                ExternalLookupCache.provider_id == provider_id,
+                ExternalLookupCache.user_id.is_(None),
+                ExternalLookupCache.search_mode == ExternalLookupSearchMode.NORMALIZED,
+            )
+            .group_by(ExternalLookupCache.normalized_query)
+            .subquery()
+        )
+        now = _as_utc(self.external_lookup_service.now_fn())
+        fresh_completed_cache = (
+            ExternalLookupCache.provider_id == provider_id,
+            ExternalLookupCache.user_id.is_(None),
+            ExternalLookupCache.search_mode == ExternalLookupSearchMode.NORMALIZED,
+            ExternalLookupCache.status == ExternalLookupStatus.COMPLETED,
+            (ExternalLookupCache.expires_at.is_(None) | (ExternalLookupCache.expires_at > now)),
+        )
+        has_result = exists(
+            select(ExternalLookupResult.id).where(
+                ExternalLookupResult.cache_id == ExternalLookupCache.id,
+            )
+        )
+        total_forms, found_count, not_found_count, is_provider_active = session.execute(
+            select(
+                func.count(forms_subquery.c.normalized_form),
+                func.count(forms_subquery.c.normalized_form).filter(
+                    *fresh_completed_cache,
+                    has_result,
+                ),
+                func.count(forms_subquery.c.normalized_form).filter(
+                    *fresh_completed_cache,
+                    ~has_result,
+                ),
+                provider_is_active,
+            )
+            .select_from(forms_subquery)
+            .outerjoin(
+                latest_cache_subquery,
+                forms_subquery.c.normalized_form == latest_cache_subquery.c.normalized_query,
+            )
+            .outerjoin(
+                ExternalLookupCache,
+                and_(
+                    ExternalLookupCache.normalized_query == latest_cache_subquery.c.normalized_query,
+                    ExternalLookupCache.created_at == latest_cache_subquery.c.latest_created_at,
+                    ExternalLookupCache.provider_id == provider_id,
+                    ExternalLookupCache.user_id.is_(None),
+                    ExternalLookupCache.search_mode == ExternalLookupSearchMode.NORMALIZED,
+                ),
+            )
+        ).one()
+        total_forms = int(total_forms or 0)
         counts = {
             "found_count": 0,
             "not_found_count": 0,
-            "unchecked_count": 0,
+            "unchecked_count": total_forms,
             "unavailable_count": 0,
-            "total_forms": len(forms),
+            "total_forms": total_forms,
         }
-        for snapshot in status_map.values():
-            if snapshot.status is DocumentTrustedExternalStatus.FOUND:
-                counts["found_count"] += 1
-            elif snapshot.status is DocumentTrustedExternalStatus.NOT_FOUND:
-                counts["not_found_count"] += 1
-            elif snapshot.status is DocumentTrustedExternalStatus.UNAVAILABLE:
-                counts["unavailable_count"] += 1
-            else:
-                counts["unchecked_count"] += 1
+        if total_forms == 0:
+            return counts
+        if is_provider_active is False:
+            counts["unchecked_count"] = 0
+            counts["unavailable_count"] = total_forms
+            return counts
+        if is_provider_active is None:
+            return counts
+        counts["found_count"] = int(found_count or 0)
+        counts["not_found_count"] = int(not_found_count or 0)
+        counts["unchecked_count"] = max(total_forms - counts["found_count"] - counts["not_found_count"], 0)
         return counts
 
     def combined_has_reference_match(
@@ -212,11 +354,78 @@ class DocumentTrustedExternalService:
             return True
         return not self.external_lookup_service._cache_is_fresh(cached)  # noqa: SLF001
 
+    @staticmethod
+    def _latest_cache_subquery(*, provider_id: UUID, normalized_forms: list[str]):
+        return (
+            select(
+                ExternalLookupCache.normalized_query.label("normalized_query"),
+                func.max(ExternalLookupCache.created_at).label("latest_created_at"),
+            )
+            .where(
+                ExternalLookupCache.provider_id == provider_id,
+                ExternalLookupCache.user_id.is_(None),
+                ExternalLookupCache.search_mode == ExternalLookupSearchMode.NORMALIZED,
+                ExternalLookupCache.normalized_query.in_(normalized_forms),
+            )
+            .group_by(ExternalLookupCache.normalized_query)
+            .subquery()
+        )
+
+    @staticmethod
+    def _match_count_by_cache_id(session: Session, *, cache_ids: list[UUID]) -> dict[UUID, int]:
+        if not cache_ids:
+            return {}
+        rows = session.execute(
+            select(ExternalLookupResult.cache_id, func.count(ExternalLookupResult.id))
+            .where(ExternalLookupResult.cache_id.in_(cache_ids))
+            .group_by(ExternalLookupResult.cache_id)
+        ).all()
+        return {cache_id: int(count) for cache_id, count in rows}
+
+    @staticmethod
+    def _first_result_by_cache_id(
+        session: Session,
+        *,
+        cache_ids: list[UUID],
+    ) -> dict[UUID, ExternalLookupResult]:
+        if not cache_ids:
+            return {}
+        result_rank = (
+            func.row_number()
+            .over(
+                partition_by=ExternalLookupResult.cache_id,
+                order_by=ExternalLookupResult.created_at.asc(),
+            )
+            .label("result_rank")
+        )
+        ranked_results = (
+            select(
+                ExternalLookupResult.id.label("result_id"),
+                ExternalLookupResult.cache_id.label("cache_id"),
+                result_rank,
+            )
+            .where(ExternalLookupResult.cache_id.in_(cache_ids))
+            .subquery()
+        )
+        first_result_ids = list(
+            session.scalars(
+                select(ranked_results.c.result_id).where(ranked_results.c.result_rank == 1)
+            ).all()
+        )
+        if not first_result_ids:
+            return {}
+        rows = session.scalars(
+            select(ExternalLookupResult).where(ExternalLookupResult.id.in_(first_result_ids))
+        ).all()
+        return {row.cache_id: row for row in rows}
+
     def _snapshot_from_cache(
         self,
         cache_row: ExternalLookupCache | None,
         *,
         provider_display_name: str,
+        first_result: ExternalLookupResult | None = None,
+        match_count: int | None = None,
     ) -> NayiriLookupSnapshot:
         if cache_row is None:
             return NayiriLookupSnapshot(
@@ -236,8 +445,9 @@ class DocumentTrustedExternalService:
                 provider_display_name=provider_display_name,
             )
 
-        if cache_row.results:
-            first = cache_row.results[0]
+        resolved_match_count = match_count if match_count is not None else len(cache_row.results)
+        first = first_result if first_result is not None else (cache_row.results[0] if cache_row.results else None)
+        if first is not None and resolved_match_count > 0:
             metadata = first.metadata_json or {}
             query_text = (cache_row.query_text or "").strip()
             matched_form = (first.matched_form or "").strip()
@@ -254,7 +464,7 @@ class DocumentTrustedExternalService:
             return NayiriLookupSnapshot(
                 status=DocumentTrustedExternalStatus.FOUND,
                 provider_display_name=provider_display_name,
-                match_count=len(cache_row.results),
+                match_count=resolved_match_count,
                 matched_form=first.matched_form,
                 source_title=first.source_title,
                 reference_link=first.reference_link,

@@ -1,6 +1,6 @@
 # Armenian Historical Books OCR Backend
 
-MVP-4 backend for authenticated uploads, page-by-page text extraction, OCR fallback with `pytesseract`, Armenian line-break reconstruction before tokenization, raw word-occurrence indexing, reviewer-centric lexicon discovery, curated lexeme management, personal reference-source matching, source-first reference-entry review, backend-only trusted external word lookup through a Nayiri web provider abstraction, backend-defined long-running job progress tracking against Supabase Postgres and Storage, and an asynchronous PIE-based morphology layer for eligible Classical Armenian sources.
+MVP-4 backend for authenticated uploads, page-by-page text extraction, OCR fallback with `pytesseract`, Armenian line-break reconstruction before tokenization, raw word-occurrence indexing, reviewer-centric lexicon discovery, curated lexeme management, personal reference-source matching, source-first reference-entry review, backend-only trusted external word lookup, backend-defined long-running job progress tracking against Supabase Postgres and Storage, and an asynchronous PIE-based morphology layer for eligible Classical Armenian sources.
 
 ## Stack
 
@@ -91,13 +91,48 @@ docker compose up -d redis
 uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
-9. Start the Celery worker in a second terminal:
+9. Start Celery workers in separate terminals by workload:
 
 ```bash
 source .venv/bin/activate
 cd backend
-celery -A app.core.celery_app.celery_app worker -l info
+celery -A app.core.celery_app.celery_app worker -l info -Q ingestion \
+  --pool="${CELERY_WORKER_POOL:-prefork}" \
+  --concurrency="${CELERY_QUEUE_INGESTION_CONCURRENCY:-2}"
+
+celery -A app.core.celery_app.celery_app worker -l info -Q ocr_cpu \
+  --pool="${CELERY_WORKER_POOL:-prefork}" \
+  --concurrency="${CELERY_QUEUE_OCR_CONCURRENCY:-1}"
+
+celery -A app.core.celery_app.celery_app worker -l info -Q nlp_cpu \
+  --pool="${CELERY_WORKER_POOL:-prefork}" \
+  --concurrency="${CELERY_QUEUE_NLP_CONCURRENCY:-1}"
+
+celery -A app.core.celery_app.celery_app worker -l info -Q evidence_io \
+  --pool="${CELERY_WORKER_POOL:-prefork}" \
+  --concurrency="${CELERY_QUEUE_EVIDENCE_CONCURRENCY:-2}"
+
+celery -A app.core.celery_app.celery_app worker -l info -Q discovery \
+  --pool="${CELERY_WORKER_POOL:-prefork}" \
+  --concurrency="${CELERY_QUEUE_DISCOVERY_CONCURRENCY:-2}"
+
+celery -A app.core.celery_app.celery_app worker -l info -Q external_io \
+  --pool="${CELERY_WORKER_POOL:-prefork}" \
+  --concurrency="${CELERY_QUEUE_EXTERNAL_CONCURRENCY:-1}"
 ```
+
+The queue names are `ingestion`, `ocr_cpu`, `nlp_cpu`, `evidence_io`, `discovery`,
+`external_io`, and the reserved `embeddings_ai_later` queue. The reserved embeddings
+queue exists for future AI work only and is not used by MVP2 tasks.
+Long-running tasks emit `celery_task_heartbeat` logs every `CELERY_TASK_HEARTBEAT_SECONDS`
+seconds so the worker terminal shows that OCR, PIE, reference import, and discovery jobs
+are still alive. Set `CELERY_TASK_HEARTBEAT_SECONDS=0` to disable heartbeat logs.
+
+Trusted reference checks are queued as `process_document_trusted_external_lookup_run`
+on `external_io`. The persisted job kind is still `nayiri_trusted_lookup` for database
+compatibility, but new application code should use "trusted external" names. The old
+`process_document_nayiri_lookup_run` task and `/trusted-lookups/nayiri/*` routes remain
+as compatibility aliases only.
 
 ## Full Docker Compose
 
@@ -107,7 +142,54 @@ If you want Redis, API, and worker under Compose:
 docker compose --profile fullstack up --build
 ```
 
+To run only the Celery queue workers against your existing host Redis on port `6379`:
+
+```bash
+docker compose --profile workers up --build
+```
+
+This profile does not start a second Redis container. Keep your existing host Redis running so local `uvicorn` and the Docker workers share the same broker.
+Compose mounts `../data` into the containers as `/data`, mounts the Nayiri corpus
+into the containers as `/resources/nayiri-western-corpus`, and sets resource/model
+paths for the workers:
+
+- `PIE_MODEL_ROOT=/data/pie/xcl`
+- `PIE_CLASSICAL_MODEL_PATH=/data/pie/xcl`
+- `PIE_EASTERN_MODEL_PATH=/data/pie/eastern`
+- `RESOURCE_PATH_NAYIRI_WESTERN_CORPUS=/resources/nayiri-western-corpus`
+
+Set `NAYIRI_WESTERN_CORPUS_HOST_PATH` in `.env` or the shell before starting
+Compose when the corpus lives somewhere else, for example in production:
+
+```bash
+NAYIRI_WESTERN_CORPUS_HOST_PATH=/srv/baghramyan/resources/nayiri-western-corpus docker compose --profile workers up --build
+```
+
+The Docker image installs the legacy `nlp-pie` CLI with curated modern dependency
+pins from `requirements-pie.txt` into an isolated `/opt/pie-runtime` virtualenv;
+it does not depend on a host `.pie-venv` and does not pollute the app/Celery
+Python environment. Docker workers default to `PIE_ENABLED=true` and
+`PIE_EXECUTABLE=/opt/pie-runtime/bin/pie`.
+If you need to disable morphology in Docker, start Compose with:
+
+```bash
+DOCKER_PIE_ENABLED=false docker compose --profile workers up --build
+```
+
+If you need to point Docker at a custom PIE binary inside the container, use:
+
+```bash
+DOCKER_PIE_EXECUTABLE=/path/inside/container/to/pie docker compose --profile workers up --build
+```
+
+Your local manifest can still use host-relative paths for non-Docker runs. Docker
+workers should use `RESOURCE_PATH_<RESOURCE_KEY>` container-path overrides.
+
 The compose file assumes Supabase is hosted externally and reads settings from `.env`.
+
+If a trusted reference job stays `running` after its worker died or was restarted,
+the next start request treats it as stale after `EXTERNAL_LOOKUP_STALE_JOB_MINUTES`
+(default `30`), marks it failed, and queues a fresh job.
 
 ## API
 
@@ -168,15 +250,16 @@ PIE does not replace ingestion or grouping. It runs only on pre-tokenized inputs
 
 Morphology is intentionally gated:
 
-- use `document.language_stage=classical` or `reference_source.language_stage=classical`
-- or explicitly set `morphology_profile=xcl_pie`
+- use `document.language_stage=classical` or `reference_source.language_stage=classical`, or set `morphology_profile=xcl_pie` for Classical DALiH/PIE
+- use `language_stage=eastern` or `morphology_profile=eastern_pie` for Eastern DALiH/PIE
 - if a scope is not eligible, tokens are stored as `skipped` instead of being sent to PIE
 
 Runtime requirements for morphology:
 
 - the worker environment must have a runnable PIE CLI binary
 - `PIE_EXECUTABLE` can be either `pie` or an absolute path to the binary
-- `PIE_MODEL_ROOT` must point at the unpacked Classical Armenian model artifacts
+- `PIE_MODEL_ROOT` defaults to Classical (`/data/pie/xcl` in Docker); Eastern uses `PIE_EASTERN_MODEL_PATH` (`/data/pie/eastern`)
+- pack Eastern/Classical DALiH artifacts with `python ../scripts/pack_pie_dalih_models.py eastern` (requires `nlp-pie` / `backend/.pie-venv`)
 
 Stored morphology fields include:
 
@@ -290,15 +373,24 @@ python -m app.scripts.reprocess_document <document_id>
    `.csv` requires a `surface_form` or `normalized_form` column.
    `.docx` and `.pdf` use conservative line- or paragraph-based candidate extraction rather than full dictionary parsing.
 
-10. Review extracted words directly from the source they came from.
+10. Optionally import pioNER named-entity surface evidence from Hugging Face.
+    This imports only the `Karavet/pioNER-Armenian-Named-Entity` dataset as PER/ORG/LOC evidence.
+    It does not download GloVe embeddings or enable runtime NER inference.
+
+```bash
+pip install -e ".[pioner]"
+python -m app.scripts.import_pioner_dataset
+```
+
+11. Review extracted words directly from the source they came from.
     Documents expose `/api/v1/documents/{document_id}/word-candidates`.
     Reference sources expose `/api/v1/reference-sources/{source_id}/word-candidates`, and that response is anchored by the selected source rather than by a corpus-global result list.
 
-11. Open an evidence-first drawer payload with `/api/v1/word-evidence`.
+12. Open an evidence-first drawer payload with `/api/v1/word-evidence`.
     The response consolidates traceable internal evidence rows across imported books, reference sources, and lexicon items for a normalized form.
     When `include_external=true`, it also returns trusted external evidence in a separate `external_evidence_items` array with provider labels, links, snippets, and cache metadata.
 
-12. Search words globally with `/api/v1/words/search` and perform a quick lexicon existence check with `/api/v1/words/check`.
+13. Search words globally with `/api/v1/words/search` and perform a quick lexicon existence check with `/api/v1/words/check`.
     Search groups results by `lexicon`, `imported_books`, `reference_sources`, and optional `trusted_external`.
     Quick word check can optionally include trusted external presence flags and an external status when `include_external=true`.
 

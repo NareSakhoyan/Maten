@@ -40,6 +40,13 @@ class Settings(BaseSettings):
 
     app_env: str = Field(default="development", alias="APP_ENV")
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")
+    request_slow_info_ms: int = Field(default=500, alias="REQUEST_SLOW_INFO_MS", ge=0)
+    request_slow_warning_ms: int = Field(default=1500, alias="REQUEST_SLOW_WARNING_MS", ge=0)
+    request_slow_error_ms: int = Field(default=5000, alias="REQUEST_SLOW_ERROR_MS", ge=0)
+    sql_timing_enabled: bool = Field(default=True, alias="SQL_TIMING_ENABLED")
+    sql_slow_query_ms: int = Field(default=200, alias="SQL_SLOW_QUERY_MS", ge=0)
+    otel_enabled: bool = Field(default=False, alias="OTEL_ENABLED")
+    otel_service_name: str = Field(default="baghramyan-backend", alias="OTEL_SERVICE_NAME")
     api_host: str = Field(default="0.0.0.0", alias="API_HOST")
     api_port: int = Field(default=8000, alias="API_PORT")
     cors_allow_origins: str = Field(
@@ -52,6 +59,8 @@ class Settings(BaseSettings):
     )
 
     database_url: str = Field(alias="DATABASE_URL")
+    database_pool_pre_ping: bool = Field(default=False, alias="DATABASE_POOL_PRE_PING")
+    database_pool_recycle_seconds: int = Field(default=1800, alias="DATABASE_POOL_RECYCLE_SECONDS", ge=-1)
 
     supabase_url: str = Field(alias="SUPABASE_URL")
     supabase_publishable_key: str = Field(default="", alias="SUPABASE_PUBLISHABLE_KEY")
@@ -85,6 +94,19 @@ class Settings(BaseSettings):
         default="redis://localhost:6379/1",
         alias="CELERY_RESULT_BACKEND",
     )
+    celery_worker_pool: str = Field(default="prefork", alias="CELERY_WORKER_POOL")
+    celery_worker_concurrency: int = Field(default=4, alias="CELERY_WORKER_CONCURRENCY", ge=2)
+    celery_task_heartbeat_seconds: int = Field(default=15, alias="CELERY_TASK_HEARTBEAT_SECONDS", ge=0)
+    celery_queue_ingestion_concurrency: int = Field(default=2, alias="CELERY_QUEUE_INGESTION_CONCURRENCY", ge=1)
+    celery_queue_ocr_concurrency: int = Field(default=1, alias="CELERY_QUEUE_OCR_CONCURRENCY", ge=1)
+    celery_queue_nlp_concurrency: int = Field(default=1, alias="CELERY_QUEUE_NLP_CONCURRENCY", ge=1)
+    celery_queue_discovery_concurrency: int = Field(default=2, alias="CELERY_QUEUE_DISCOVERY_CONCURRENCY", ge=1)
+    celery_queue_external_concurrency: int = Field(default=1, alias="CELERY_QUEUE_EXTERNAL_CONCURRENCY", ge=1)
+    celery_queue_evidence_concurrency: int = Field(default=2, alias="CELERY_QUEUE_EVIDENCE_CONCURRENCY", ge=1)
+    max_active_jobs_per_user: int = Field(default=3, alias="MAX_ACTIVE_JOBS_PER_USER", ge=1)
+    max_active_ocr_jobs_global: int = Field(default=1, alias="MAX_ACTIVE_OCR_JOBS_GLOBAL", ge=1)
+    max_active_external_lookups_global: int = Field(default=1, alias="MAX_ACTIVE_EXTERNAL_LOOKUPS_GLOBAL", ge=1)
+    external_lookup_stale_job_minutes: int = Field(default=30, alias="EXTERNAL_LOOKUP_STALE_JOB_MINUTES", ge=1)
 
     tessdata_prefix: str | None = Field(default=None, alias="TESSDATA_PREFIX")
     tesseract_lang: str = Field(default="hye-calfa-n", alias="TESSERACT_LANG")
@@ -117,10 +139,15 @@ class Settings(BaseSettings):
     pie_enabled: bool = Field(default=True, alias="PIE_ENABLED")
     pie_executable: str = Field(default="pie", alias="PIE_EXECUTABLE")
     pie_model_root: str | None = Field(default=None, alias="PIE_MODEL_ROOT")
+    pie_eastern_model_path: str | None = Field(default=None, alias="PIE_EASTERN_MODEL_PATH")
+    pie_classical_model_path: str | None = Field(default=None, alias="PIE_CLASSICAL_MODEL_PATH")
+    pie_default_profile: str = Field(default="classical", alias="PIE_DEFAULT_PROFILE")
     pie_model_key: str = Field(default="xcl", alias="PIE_MODEL_KEY")
     pie_batch_size: int = Field(default=8, alias="PIE_BATCH_SIZE", ge=1)
     pie_max_tokens_per_batch: int = Field(default=256, alias="PIE_MAX_TOKENS_PER_BATCH", ge=1)
+    pie_timeout_seconds: float = Field(default=30.0, alias="PIE_TIMEOUT_SECONDS", gt=0)
     pie_run_only_for_classical: bool = Field(default=True, alias="PIE_RUN_ONLY_FOR_CLASSICAL")
+    resource_manifest_path: str | None = Field(default=None, alias="RESOURCE_MANIFEST_PATH")
 
     @field_validator("database_url", mode="before")
     @classmethod
@@ -157,6 +184,22 @@ class Settings(BaseSettings):
         normalized = value.strip().strip('"').strip("'")
         return normalized or None
 
+    @field_validator("pie_eastern_model_path", "pie_classical_model_path", mode="before")
+    @classmethod
+    def normalize_optional_path(cls, value: str | None) -> str | None:
+        if not isinstance(value, str):
+            return value
+        normalized = value.strip().strip('"').strip("'")
+        return normalized or None
+
+    @field_validator("pie_default_profile", mode="before")
+    @classmethod
+    def normalize_pie_default_profile(cls, value: str) -> str:
+        if not isinstance(value, str):
+            return value
+        normalized = value.strip().strip('"').strip("'").lower()
+        return normalized or "classical"
+
     @field_validator("pie_executable", mode="before")
     @classmethod
     def normalize_pie_executable(cls, value: str) -> str:
@@ -164,6 +207,14 @@ class Settings(BaseSettings):
             return value
         normalized = value.strip().strip('"').strip("'")
         return normalized or "pie"
+
+    @field_validator("resource_manifest_path", mode="before")
+    @classmethod
+    def normalize_resource_manifest_path(cls, value: str | None) -> str | None:
+        if not isinstance(value, str):
+            return value
+        normalized = value.strip().strip('"').strip("'")
+        return normalized or None
 
     @property
     def max_upload_bytes(self) -> int:

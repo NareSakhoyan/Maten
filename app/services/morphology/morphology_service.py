@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import logging
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from uuid import UUID
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session, joinedload
 
 from app.core.config import Settings, get_settings
@@ -32,11 +33,13 @@ from app.schemas.morphology import (
 )
 from app.services.job_progress_service import JobProgressService, get_job_progress_service
 from app.services.morphology.pie_adapter import PieAdapter, get_pie_adapter
-from app.services.morphology.pie_runner import PieRunner, get_pie_runner
+from app.services.morphology.pie_runner import PieRunner, PieRuntimeError, get_pie_runner
 from app.services.tokenization_service import TokenizationService, get_tokenization_service
 from app.utils.text_normalization import normalize_token
 from app.utils.token_classification import classify_token
 
+
+logger = logging.getLogger(__name__)
 
 IMPORTED_BOOK_SOURCE_TYPE = "imported_book"
 REFERENCE_SOURCE_ANALYSIS_TYPE = "reference_source"
@@ -141,7 +144,7 @@ class MorphologyService:
             session,
             job_kind=JobKind.MORPHOLOGY,
             job=run,
-            stage_code="queued",
+            stage_code="morphology_pending",
             progress_percent=0,
         )
         session.commit()
@@ -268,11 +271,13 @@ class MorphologyService:
             return
 
         had_completed_prediction = False
+        pie_profile = self._profile_for_scope(scope)
         for sequence_batch in self._iter_sequence_batches(list(eligible_sequences.values())):
             batch_size = sum(len(sequence) for sequence in sequence_batch)
             try:
                 raw_predictions = self.pie_runner.analyze_sequences(
-                    [[token.token_surface for token in sequence] for sequence in sequence_batch]
+                    [[token.token_surface for token in sequence] for sequence in sequence_batch],
+                    profile=pie_profile,
                 )
                 for token_sequence, prediction_sequence in zip(sequence_batch, raw_predictions, strict=True):
                     for token, prediction in zip(token_sequence, prediction_sequence, strict=True):
@@ -310,16 +315,27 @@ class MorphologyService:
                                 )
                             )
             except Exception as exc:
-                if failure_for_run is None:
-                    failure_for_run = str(exc)
-                analysis_rows.extend(
-                    self._build_status_rows(
-                        [token for sequence in sequence_batch for token in sequence],
-                        status=MorphologyAnalysisStatus.FAILED,
-                        analyzer_version=analyzer_version,
-                        failure_reason=str(exc),
+                unavailable_reason = self._pie_unavailable_reason(exc)
+                if unavailable_reason is not None:
+                    analysis_rows.extend(
+                        self._build_status_rows(
+                            [token for sequence in sequence_batch for token in sequence],
+                            status=MorphologyAnalysisStatus.SKIPPED,
+                            analyzer_version=analyzer_version,
+                            failure_reason=unavailable_reason,
+                        )
                     )
-                )
+                else:
+                    if failure_for_run is None:
+                        failure_for_run = str(exc)
+                    analysis_rows.extend(
+                        self._build_status_rows(
+                            [token for sequence in sequence_batch for token in sequence],
+                            status=MorphologyAnalysisStatus.FAILED,
+                            analyzer_version=analyzer_version,
+                            failure_reason=str(exc),
+                        )
+                    )
 
             processed_items += batch_size
             self._update_run_progress(
@@ -345,35 +361,53 @@ class MorphologyService:
         user_id: UUID,
         document_id: UUID,
     ) -> MorphologySummaryResponse:
-        document = session.scalar(
-            select(Document).where(
+        summary = session.execute(
+            select(
+                func.count(func.distinct(Document.id)),
+                func.count(func.distinct(MorphologyAnalysis.occurrence_id)).filter(
+                    MorphologyAnalysis.occurrence_id.is_not(None),
+                ),
+                func.count(MorphologyAnalysis.id).filter(
+                    MorphologyAnalysis.analysis_status == MorphologyAnalysisStatus.COMPLETED,
+                ),
+                func.count(MorphologyAnalysis.id).filter(
+                    MorphologyAnalysis.analysis_status == MorphologyAnalysisStatus.SKIPPED,
+                ),
+                func.count(MorphologyAnalysis.id).filter(
+                    MorphologyAnalysis.analysis_status == MorphologyAnalysisStatus.FAILED,
+                ),
+                func.count(func.distinct(MorphologyAnalysis.lemma_normalized)).filter(
+                    MorphologyAnalysis.analysis_status == MorphologyAnalysisStatus.COMPLETED,
+                    MorphologyAnalysis.lemma_normalized.is_not(None),
+                    MorphologyAnalysis.lemma_normalized != "",
+                ),
+            )
+            .select_from(Document)
+            .outerjoin(
+                MorphologyAnalysis,
+                (MorphologyAnalysis.document_id == Document.id)
+                & (MorphologyAnalysis.user_id == str(user_id)),
+            )
+            .where(
                 Document.id == document_id,
                 Document.user_id == user_id,
             )
-        )
-        if document is None:
+        ).one()
+        (
+            document_count,
+            analyzed_occurrence_count,
+            completed_count,
+            skipped_count,
+            failed_count,
+            distinct_lemma_count,
+        ) = (int(value or 0) for value in summary)
+        if document_count == 0:
             raise ValueError("Document not found.")
-
-        rows = list(
-            session.scalars(
-                select(MorphologyAnalysis).where(
-                    MorphologyAnalysis.user_id == str(user_id),
-                    MorphologyAnalysis.document_id == document_id,
-                )
-            )
-        )
-        analyzed_occurrence_count = len({row.occurrence_id for row in rows if row.occurrence_id is not None})
-        completed_rows = [row for row in rows if row.analysis_status is MorphologyAnalysisStatus.COMPLETED]
-        skipped_rows = [row for row in rows if row.analysis_status is MorphologyAnalysisStatus.SKIPPED]
-        failed_rows = [row for row in rows if row.analysis_status is MorphologyAnalysisStatus.FAILED]
-        distinct_lemma_count = len(
-            {row.lemma_normalized for row in completed_rows if row.lemma_normalized}
-        )
         return MorphologySummaryResponse(
             analyzed_occurrence_count=analyzed_occurrence_count,
-            completed_count=len(completed_rows),
-            skipped_count=len(skipped_rows),
-            failed_count=len(failed_rows),
+            completed_count=completed_count,
+            skipped_count=skipped_count,
+            failed_count=failed_count,
             distinct_lemma_count=distinct_lemma_count,
         )
 
@@ -541,13 +575,43 @@ class MorphologyService:
 
     def _scope_is_eligible(self, scope: MorphologyScope) -> bool:
         profile = (scope.morphology_profile or "").strip().lower()
-        if profile and profile == f"{self.settings.pie_model_key.lower()}_pie":
-            return True
-        if profile and profile != f"{self.settings.pie_model_key.lower()}_pie":
+        stage = (scope.language_stage or "").strip().lower()
+        if profile:
+            if profile == f"{self.settings.pie_model_key.lower()}_pie" or profile.startswith("xcl"):
+                return True
+            if profile.startswith("eastern") or profile == "hye_pie":
+                return self.pie_runner.resource_registry.pie_model_path("eastern") is not None
             return False
         if not self.settings.pie_run_only_for_classical:
             return True
-        return (scope.language_stage or "").strip().lower() == "classical"
+        if stage == "classical":
+            return True
+        if stage == "eastern":
+            return self.pie_runner.resource_registry.pie_model_path("eastern") is not None
+        return False
+
+    def _profile_for_scope(self, scope: MorphologyScope) -> str:
+        profile = (scope.morphology_profile or "").strip().lower()
+        if profile.startswith("xcl") or (scope.language_stage or "").strip().lower() == "classical":
+            return "classical"
+        if profile.startswith("eastern"):
+            return "eastern"
+        return self.settings.pie_default_profile
+
+    @staticmethod
+    def _pie_unavailable_reason(exc: Exception) -> str | None:
+        if not isinstance(exc, PieRuntimeError):
+            return None
+        message = str(exc)
+        unavailable_markers = (
+            "PIE morphology analysis is disabled",
+            "PIE executable could not be found",
+            "PIE_MODEL_ROOT is not configured",
+            "PIE model root does not exist",
+        )
+        if any(marker in message for marker in unavailable_markers):
+            return f"pie_unavailable: {message}"
+        return None
 
     @staticmethod
     def _token_skip_reason(token: MorphologyTokenInput) -> str | None:
@@ -633,8 +697,11 @@ class MorphologyService:
         run_status: MorphologyRunStatus,
         error_message: str | None = None,
     ) -> None:
+        document_discovery_target: tuple[UUID, UUID] | None = None
         with session_scope() as session:
             run = self._load_run(session, run_id)
+            if run.document_id is not None:
+                document_discovery_target = (UUID(run.user_id), run.document_id)
             self.job_progress_service.set_stage(
                 session,
                 job_kind=JobKind.MORPHOLOGY,
@@ -689,7 +756,27 @@ class MorphologyService:
                     session,
                     job_kind=JobKind.MORPHOLOGY,
                     job=run,
+                    stage_code="morphology_done",
                 )
+        if document_discovery_target is not None:
+            self._start_document_discovery_after_morphology(*document_discovery_target)
+
+    def _start_document_discovery_after_morphology(self, user_id: UUID, document_id: UUID) -> None:
+        from app.services.discovery.discovery_candidate_service import get_discovery_candidate_service
+
+        try:
+            with session_scope() as session:
+                get_discovery_candidate_service().start_build_run(
+                    session,
+                    user_id=user_id,
+                    document_id=document_id,
+                )
+        except Exception:
+            logger.exception(
+                "Failed to start discovery build after morphology user_id=%s document_id=%s",
+                user_id,
+                document_id,
+            )
 
     def _delete_existing_scope_rows(self, session: Session, run: MorphologyRun) -> None:
         delete_stmt = delete(MorphologyAnalysis).where(
@@ -711,7 +798,7 @@ class MorphologyService:
                 session,
                 job_kind=JobKind.MORPHOLOGY,
                 job=run,
-                stage_code="running_pie",
+                stage_code="morphology_running",
                 progress_percent=self.job_progress_service.ranged_progress(
                     processed_items,
                     total_items,

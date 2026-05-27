@@ -6,6 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_user, get_db_session
+from app.core.security import forbidden
 from app.schemas.morphology import MorphologyWordResponse
 from app.schemas.word import (
     NayiriCorpusCheckResponse,
@@ -75,6 +76,8 @@ def _resolve_search_categories(
         resolved_categories.append(WordSearchCategory.REFERENCE_SOURCES)
     if include_trusted_external:
         resolved_categories.append(WordSearchCategory.TRUSTED_EXTERNAL)
+    if not resolved_categories:
+        return None, bool(include_trusted_external)
     return resolved_categories, bool(include_trusted_external)
 
 
@@ -91,6 +94,8 @@ async def get_word_evidence(
     session: Session = Depends(get_db_session),
     word_evidence_service: WordEvidenceService = Depends(get_word_evidence_service),
 ) -> WordEvidenceResponse:
+    if include_external and current_user.role != "admin":
+        raise forbidden("Admin access is required for external provider lookup.")
     try:
         resolved_source_type = _resolve_word_evidence_source_type(source_type)
         return word_evidence_service.get_word_evidence(
@@ -149,6 +154,8 @@ async def search_words(
             include_reference_sources=include_reference_sources,
             include_trusted_external=include_trusted_external,
         )
+        if (include_external or resolved_include_external or provider_keys) and current_user.role != "admin":
+            raise forbidden("Admin access is required for external provider lookup.")
         return word_search_service.search(
             session,
             user_id=current_user.user_id,
@@ -172,6 +179,8 @@ async def check_word(
     session: Session = Depends(get_db_session),
     word_search_service: WordSearchService = Depends(get_word_search_service),
 ) -> WordCheckResponse:
+    if (include_external or provider_keys) and current_user.role != "admin":
+        raise forbidden("Admin access is required for external provider lookup.")
     try:
         return word_search_service.check(
             session,
@@ -188,6 +197,7 @@ async def check_word(
 async def check_word_in_nayiri_corpus(
     q: str = Query(..., min_length=1),
     limit: int = Query(default=8, ge=1, le=30),
+    current_user: AuthenticatedUser = Depends(get_current_user),
     nayiri_corpus_service: NayiriCorpusService = Depends(get_nayiri_corpus_service),
 ) -> NayiriCorpusCheckResponse:
     matches = nayiri_corpus_service.lookup(q, limit=limit)

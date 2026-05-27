@@ -6,7 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
 
-from app.api.deps import get_current_user, get_db_session
+from app.api.deps import get_db_session, require_admin_user
 from app.schemas.lexicon import (
     LexiconActionRequest,
     LexiconActionResponse,
@@ -51,7 +51,7 @@ async def list_lexicon_groups(
     include_reference_summary: bool = Query(default=False),
     limit: int = Query(default=20, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
-    current_user: AuthenticatedUser = Depends(get_current_user),
+    current_user: AuthenticatedUser = Depends(require_admin_user),
     session: Session = Depends(get_db_session),
     lexicon_service: LexiconService = Depends(get_lexicon_service),
 ) -> LexiconGroupListResponse:
@@ -74,7 +74,7 @@ async def list_lexicon_groups(
 @router.post("/actions", response_model=LexiconActionResponse)
 async def apply_lexicon_action(
     request: LexiconActionRequest,
-    current_user: AuthenticatedUser = Depends(get_current_user),
+    current_user: AuthenticatedUser = Depends(require_admin_user),
     session: Session = Depends(get_db_session),
     action_service: LexiconActionService = Depends(get_lexicon_action_service),
 ) -> LexiconActionResponse | JSONResponse:
@@ -93,7 +93,7 @@ async def apply_lexicon_action(
 @router.get("/groups/{normalized_form}", response_model=LexiconGroupDetail)
 async def get_lexicon_group_detail(
     normalized_form: str,
-    current_user: AuthenticatedUser = Depends(get_current_user),
+    current_user: AuthenticatedUser = Depends(require_admin_user),
     session: Session = Depends(get_db_session),
     lexicon_service: LexiconService = Depends(get_lexicon_service),
 ) -> LexiconGroupDetail:
@@ -111,7 +111,7 @@ async def get_lexicon_group_detail(
 @router.post("/rebuild-index", response_model=LexiconIndexRebuildResponse)
 async def rebuild_user_lexicon_index(
     background: bool = Query(default=False),
-    current_user: AuthenticatedUser = Depends(get_current_user),
+    current_user: AuthenticatedUser = Depends(require_admin_user),
     session: Session = Depends(get_db_session),
     rebuild_service: LexiconIndexRebuildService = Depends(get_lexicon_index_rebuild_service),
 ) -> LexiconIndexRebuildResponse:
@@ -132,7 +132,7 @@ async def rebuild_user_lexicon_index(
 @router.get("/groups/{normalized_form}/reference-matches", response_model=ReferenceTargetMatchesResponse)
 async def get_lexicon_group_reference_matches(
     normalized_form: str,
-    current_user: AuthenticatedUser = Depends(get_current_user),
+    current_user: AuthenticatedUser = Depends(require_admin_user),
     session: Session = Depends(get_db_session),
     lexicon_service: LexiconService = Depends(get_lexicon_service),
     reference_matching_service: ReferenceMatchingService = Depends(get_reference_matching_service),

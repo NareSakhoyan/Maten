@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 
 from fastapi import APIRouter, FastAPI
 from fastapi.exception_handlers import http_exception_handler, request_validation_exception_handler
@@ -11,10 +12,12 @@ from sqlalchemy import text
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api.routers import documents, health, jobs, lexemes, lexicon, me, morphology, occurrences, reference_matching, reference_sources, words
+from app.api.routers import discovery, documents, health, jobs, lexemes, lexicon, me, morphology, occurrences, reference_matching, reference_sources, words
 from app.core.config import get_settings
 from app.core.database import engine
 from app.core.logging import configure_logging
+from app.core.otel import configure_opentelemetry
+from app.core.performance import install_sql_timing, request_timing_middleware
 
 
 logger = logging.getLogger("app.api.errors")
@@ -38,6 +41,9 @@ def create_app() -> FastAPI:
         title="Armenian Historical Books OCR API",
         version="0.1.0",
     )
+    install_sql_timing(engine, settings)
+    configure_opentelemetry(app, engine, settings)
+    app.middleware("http")(lambda request, call_next: request_timing_middleware(request, call_next, settings=settings))
     app.add_middleware(
         CORSMiddleware,
         allow_origins=settings.cors_allow_origins_list,
@@ -47,13 +53,16 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
     )
 
-    @app.on_event("startup")
     def warm_database_pool() -> None:
         try:
             with engine.connect() as connection:
                 connection.execute(text("SELECT 1"))
         except Exception:
             logger.warning("Database pool warmup failed; first request will retry connection.", exc_info=True)
+
+    @app.on_event("startup")
+    def start_database_pool_warmup() -> None:
+        threading.Thread(target=warm_database_pool, name="database-pool-warmup", daemon=True).start()
 
     @app.exception_handler(StarletteHTTPException)
     async def log_http_exception(request: Request, exc: StarletteHTTPException):
@@ -78,6 +87,7 @@ def create_app() -> FastAPI:
     api_v1.include_router(health.router, tags=["health"])
     api_v1.include_router(me.router, tags=["me"])
     api_v1.include_router(documents.router, tags=["documents"])
+    api_v1.include_router(discovery.router, tags=["discovery"])
     api_v1.include_router(occurrences.router, tags=["occurrences"])
     api_v1.include_router(jobs.router, tags=["jobs"])
     api_v1.include_router(lexicon.router, tags=["lexicon"])

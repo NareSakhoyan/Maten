@@ -30,7 +30,7 @@ from app.services.document_service import DocumentService
 from app.services.long_running_job_service import LongRunningJobService
 from app.services.morphology.morphology_service import MorphologyService
 from app.services.morphology.pie_adapter import PieAdapter
-from app.services.morphology.pie_runner import PieRawPrediction
+from app.services.morphology.pie_runner import PieRawPrediction, PieRuntimeError
 from app.services.occurrence_service import OccurrenceService
 from app.services.reference_source_service import ReferenceSourceService
 from conftest import PRIMARY_USER_ID
@@ -41,7 +41,7 @@ class RecordingPieRunner:
         self.failure = failure
         self.calls: list[list[list[str]]] = []
 
-    def analyze_sequences(self, sequences: list[list[str]]) -> list[list[PieRawPrediction]]:
+    def analyze_sequences(self, sequences: list[list[str]], *, profile: str | None = None) -> list[list[PieRawPrediction]]:  # noqa: ARG002
         self.calls.append(sequences)
         if self.failure is not None:
             raise self.failure
@@ -173,6 +173,26 @@ def test_morphology_service_eligibility_uses_profile_override() -> None:
             morphology_profile=None,
         )
     )
+
+
+def test_morphology_service_eligibility_allows_eastern_profile() -> None:
+    service = MorphologyService()
+    eastern_available = service.pie_runner.resource_registry.pie_model_path("eastern") is not None
+
+    assert service._scope_is_eligible(  # noqa: SLF001
+        morphology_service_module.MorphologyScope(
+            source_type="imported_book",
+            language_stage="modern",
+            morphology_profile="eastern_pie",
+        )
+    ) == eastern_available
+    assert service._scope_is_eligible(  # noqa: SLF001
+        morphology_service_module.MorphologyScope(
+            source_type="imported_book",
+            language_stage="eastern",
+            morphology_profile=None,
+        )
+    ) == eastern_available
 
 
 def test_morphology_service_uses_pre_tokenized_page_batches_and_persists_lemma_normalized(
@@ -324,6 +344,44 @@ def test_morphology_service_marks_failed_rows_when_pie_runtime_fails(
     assert refreshed_run is not None
     assert refreshed_run.status is MorphologyRunStatus.FAILED
     assert refreshed_run.failed_count == 1
+
+
+def test_morphology_service_skips_rows_when_pie_is_unavailable(
+    db_session: Session,
+    session_factory,
+    monkeypatch,
+) -> None:
+    _patch_session_scope(monkeypatch, session_factory)
+    document = _create_document_with_occurrences(
+        db_session,
+        language_stage="classical",
+        page_texts=["Բան"],
+    )
+    service = MorphologyService(
+        pie_runner=RecordingPieRunner(failure=PieRuntimeError("The PIE executable could not be found."))
+    )
+    run = service.create_run(
+        db_session,
+        user_id=PRIMARY_USER_ID,
+        request=MorphologyRunCreateRequest(document_id=document.id),
+    )
+
+    service.process_run(run.id)
+
+    row = db_session.scalar(
+        select(MorphologyAnalysis).where(MorphologyAnalysis.document_id == document.id)
+    )
+    assert row is not None
+    assert row.analysis_status is MorphologyAnalysisStatus.SKIPPED
+    assert row.failure_reason is not None
+    assert row.failure_reason.startswith("pie_unavailable:")
+
+    db_session.expire_all()
+    refreshed_run = db_session.get(MorphologyRun, run.id)
+    assert refreshed_run is not None
+    assert refreshed_run.status is MorphologyRunStatus.COMPLETED
+    assert refreshed_run.skipped_count == 1
+    assert refreshed_run.failed_count == 0
 
 
 def test_create_morphology_run_enqueues_background_job(

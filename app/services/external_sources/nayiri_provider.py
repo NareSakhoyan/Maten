@@ -224,6 +224,10 @@ class NayiriProvider(ExternalLookupProvider):
                         "request_url": request_url,
                         "section_title": source_subtitle,
                         "href": anchor["href"],
+                        # Nayiri page hits are traceable context and not direct lexical validation.
+                        "source_evidence_role": "nayiri_page_result",
+                        "source_evidence_tier": "context_only",
+                        "source_evidence_verified": False,
                     },
                 )
             )

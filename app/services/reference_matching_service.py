@@ -145,6 +145,7 @@ REFERENCE_REQUIRED_COLUMNS = {
         "match_type",
     },
 }
+_REFERENCE_SCHEMA_AVAILABLE: bool | None = None
 
 
 @dataclass(slots=True)
@@ -1522,6 +1523,8 @@ class ReferenceMatchingService:
         matches: dict[tuple[UUID, UUID, ReferenceMatchType], LiveReferenceMatch] = {}
         threshold = float(self.settings.reference_fuzzy_threshold_default)
         for target_value in target_values:
+            if len(target_value) <= 2:
+                continue
             prefix_length = 2 if len(target_value) >= 4 else 1
             candidates = catalog.fuzzy_buckets.get((prefix_length, target_value[:prefix_length]), [])
             for entry in candidates:
@@ -2183,6 +2186,10 @@ class ReferenceMatchingService:
             )
 
     def reference_schema_available(self, session: Session) -> bool:
+        global _REFERENCE_SCHEMA_AVAILABLE
+        if _REFERENCE_SCHEMA_AVAILABLE is True:
+            return True
+
         try:
             inspector = inspect(session.connection())
             missing_tables = [
@@ -2208,6 +2215,7 @@ class ReferenceMatchingService:
                     missing_columns,
                 )
                 return False
+            _REFERENCE_SCHEMA_AVAILABLE = True
             return True
         except ProgrammingError as exc:  # pragma: no cover - depends on live database state
             if self._is_missing_reference_table_error(exc):

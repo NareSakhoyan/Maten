@@ -1,46 +1,108 @@
+x-backend: &backend
+  build:
+    context: .
+    dockerfile: Dockerfile
+  env_file:
+    - .env
+  extra_hosts:
+    - "host.docker.internal:host-gateway"
+  volumes:
+    - ./:/app
+    - ../data:/data:ro
+    - ${NAYIRI_WESTERN_CORPUS_HOST_PATH:-../nayiri-corpus-of-western-armenian-2026-02-25-v2}:/resources/nayiri-western-corpus:ro
+
+x-backend-host-redis: &backend-host-redis
+  <<: *backend
+  environment:
+    REDIS_URL: redis://host.docker.internal:6379/0
+    CELERY_BROKER_URL: redis://host.docker.internal:6379/0
+    CELERY_RESULT_BACKEND: redis://host.docker.internal:6379/1
+    PIE_ENABLED: ${DOCKER_PIE_ENABLED:-true}
+    PIE_EXECUTABLE: ${DOCKER_PIE_EXECUTABLE:-/opt/pie-runtime/bin/pie}
+    PIE_MODEL_ROOT: /data/pie/xcl
+    PIE_CLASSICAL_MODEL_PATH: /data/pie/xcl
+    PIE_EASTERN_MODEL_PATH: /data/pie/eastern
+    RESOURCE_PATH_NAYIRI_WESTERN_CORPUS: /resources/nayiri-western-corpus
+
+x-backend-docker-redis: &backend-docker-redis
+  <<: *backend
+  environment:
+    REDIS_URL: redis://redis:6379/0
+    CELERY_BROKER_URL: redis://redis:6379/0
+    CELERY_RESULT_BACKEND: redis://redis:6379/1
+    PIE_ENABLED: ${DOCKER_PIE_ENABLED:-true}
+    PIE_EXECUTABLE: ${DOCKER_PIE_EXECUTABLE:-/opt/pie-runtime/bin/pie}
+    PIE_MODEL_ROOT: /data/pie/xcl
+    PIE_CLASSICAL_MODEL_PATH: /data/pie/xcl
+    PIE_EASTERN_MODEL_PATH: /data/pie/eastern
+    RESOURCE_PATH_NAYIRI_WESTERN_CORPUS: /resources/nayiri-western-corpus
+  depends_on:
+    - redis
+
 services:
   redis:
     image: redis:7-alpine
+    profiles: ["fullstack"]
     ports:
-      - "6379:6379"
+      - "6380:6379"
 
   api:
-    image: python:3.12-slim
+    <<: *backend-docker-redis
     profiles: ["fullstack"]
-    working_dir: /app
-    env_file:
-      - .env
-    volumes:
-      - ./:/app
-    depends_on:
-      - redis
     ports:
       - "8000:8000"
-    command:
-      - bash
-      - -lc
-      - |
-        apt-get update && \
-        apt-get install -y --no-install-recommends tesseract-ocr libgl1 libglib2.0-0 && \
-        pip install --no-cache-dir -e . && \
-        uvicorn app.main:app --host 0.0.0.0 --port 8000
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000
 
-  worker:
-    image: python:3.12-slim
-    profiles: ["fullstack"]
-    working_dir: /app
-    env_file:
-      - .env
-    volumes:
-      - ./:/app
-    depends_on:
-      - redis
-    command:
-      - bash
-      - -lc
-      - |
-        apt-get update && \
-        apt-get install -y --no-install-recommends tesseract-ocr libgl1 libglib2.0-0 && \
-        pip install --no-cache-dir -e . && \
-        celery -A app.core.celery_app.celery_app worker -l info
+  worker-ingestion:
+    <<: *backend-host-redis
+    profiles: ["fullstack", "workers"]
+    command: >
+      celery -A app.core.celery_app.celery_app worker -l info
+      -Q ingestion --hostname=ingestion@%h
+      --pool=${CELERY_WORKER_POOL:-prefork}
+      --concurrency=${CELERY_QUEUE_INGESTION_CONCURRENCY:-2}
 
+  worker-ocr-cpu:
+    <<: *backend-host-redis
+    profiles: ["fullstack", "workers"]
+    command: >
+      celery -A app.core.celery_app.celery_app worker -l info
+      -Q ocr_cpu --hostname=ocr_cpu@%h
+      --pool=${CELERY_WORKER_POOL:-prefork}
+      --concurrency=${CELERY_QUEUE_OCR_CONCURRENCY:-1}
+
+  worker-nlp-cpu:
+    <<: *backend-host-redis
+    profiles: ["fullstack", "workers"]
+    command: >
+      celery -A app.core.celery_app.celery_app worker -l info
+      -Q nlp_cpu --hostname=nlp_cpu@%h
+      --pool=${CELERY_WORKER_POOL:-prefork}
+      --concurrency=${CELERY_QUEUE_NLP_CONCURRENCY:-1}
+
+  worker-evidence-io:
+    <<: *backend-host-redis
+    profiles: ["fullstack", "workers"]
+    command: >
+      celery -A app.core.celery_app.celery_app worker -l info
+      -Q evidence_io --hostname=evidence_io@%h
+      --pool=${CELERY_WORKER_POOL:-prefork}
+      --concurrency=${CELERY_QUEUE_EVIDENCE_CONCURRENCY:-2}
+
+  worker-discovery:
+    <<: *backend-host-redis
+    profiles: ["fullstack", "workers"]
+    command: >
+      celery -A app.core.celery_app.celery_app worker -l info
+      -Q discovery --hostname=discovery@%h
+      --pool=${CELERY_WORKER_POOL:-prefork}
+      --concurrency=${CELERY_QUEUE_DISCOVERY_CONCURRENCY:-2}
+
+  worker-external-io:
+    <<: *backend-host-redis
+    profiles: ["fullstack", "workers"]
+    command: >
+      celery -A app.core.celery_app.celery_app worker -l info
+      -Q external_io --hostname=external_io@%h
+      --pool=${CELERY_WORKER_POOL:-prefork}
+      --concurrency=${CELERY_QUEUE_EXTERNAL_CONCURRENCY:-1}

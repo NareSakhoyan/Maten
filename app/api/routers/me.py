@@ -5,6 +5,7 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_user, get_db_session
+from app.schemas.common import CurrentUserProfile
 from app.schemas.workflow import ReviewQueueListResponse
 from app.services.auth_service import AuthenticatedUser
 from app.services.document_workflow_service import DocumentWorkflowService, get_document_workflow_service
@@ -13,6 +14,17 @@ from app.services.long_running_job_service import LongRunningJobService, get_lon
 
 
 router = APIRouter(prefix="/me")
+
+
+@router.get("/profile", response_model=CurrentUserProfile)
+async def get_profile(
+    current_user: AuthenticatedUser = Depends(get_current_user),
+) -> CurrentUserProfile:
+    return CurrentUserProfile(
+        id=current_user.user_id,
+        email=current_user.email,
+        role=current_user.role,
+    )
 
 
 @router.get("/review-queue", response_model=ReviewQueueListResponse)

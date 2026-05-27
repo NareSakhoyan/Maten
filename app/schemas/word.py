@@ -92,6 +92,9 @@ class WordEvidenceItem(APIModel):
     match_score: float | None = None
     fetched_at: datetime | None = None
     created_at: datetime | None = None
+    source_evidence_role: str | None = None
+    source_evidence_tier: str | None = None
+    source_evidence_verified: bool | None = None
 
 
 class WordSearchResultGroup(APIModel):
@@ -120,6 +123,15 @@ class WordEvidenceSummary(APIModel):
     source_count: int
     linked_lexeme_id: UUID | None = None
     linked_lexeme_canonical_form: str | None = None
+    surface_form: str | None = None
+    normalized_form: str | None = None
+    morphological_lemma: str | None = None
+    morphological_source: str | None = None
+    morphological_standard: str | None = None
+    dictionary_lemma: str | None = None
+    dictionary_lemma_source: str | None = None
+    lexical_mapping_confidence: float | None = None
+    lexical_mapping_conflict_status: str | None = None
     best_lemma: str | None = None
     lemma_candidates: list[str] = Field(default_factory=list)
     pos_candidates: list[str] = Field(default_factory=list)
@@ -132,12 +144,29 @@ class WordEvidenceExternalSummary(APIModel):
     status: TrustedExternalLookupStatus
 
 
+class WordNamedEntityEvidenceItem(APIModel):
+    id: UUID
+    provider_key: str = "pioner_ner"
+    provider_display_name: str
+    entity_surface: str
+    normalized_surface: str
+    entity_type: str
+    source_kind: str
+    dataset_split: str
+    occurrence_count: int
+    confidence: float | None = None
+    validation_strength: str = "suggests_candidate"
+    evidence_role: str = "named_entity_signal"
+    sample_contexts: list[str] = Field(default_factory=list)
+
+
 class WordEvidenceResponse(OffsetPagination):
     normalized_form: str
     summary: WordEvidenceSummary
     evidence_items: list[WordEvidenceItem]
     external_summary: WordEvidenceExternalSummary | None = None
     external_evidence_items: list[WordEvidenceItem] = Field(default_factory=list)
+    named_entity_evidence_items: list[WordNamedEntityEvidenceItem] = Field(default_factory=list)
     related_reference_matches: list[ReferenceMatchBest] | None = None
     related_lexeme_summary: RelatedLexemeSummary | None = None
 
@@ -175,7 +204,7 @@ class DocumentWordCandidateSummary(APIModel):
     )
 
 
-class DocumentNayiriLookupSummary(APIModel):
+class DocumentTrustedExternalLookupSummary(APIModel):
     found_count: int = 0
     not_found_count: int = 0
     unchecked_count: int = 0
@@ -183,7 +212,7 @@ class DocumentNayiriLookupSummary(APIModel):
     total_forms: int = 0
 
 
-class DocumentNayiriLookupRunStartResponse(APIModel):
+class DocumentTrustedExternalLookupRunStartResponse(APIModel):
     message: str
     run_id: UUID
     job_id: UUID

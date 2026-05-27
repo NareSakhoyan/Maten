@@ -18,14 +18,19 @@ logger = logging.getLogger(__name__)
 @dataclass(frozen=True, slots=True)
 class JobTaskSpec:
     task_name: str
+    queue: str
 
 
 JOB_TASKS: dict[JobKind, JobTaskSpec] = {
-    JobKind.INGESTION: JobTaskSpec("app.workers.tasks.process_document_ingestion"),
-    JobKind.REFERENCE_IMPORT: JobTaskSpec("app.workers.tasks.process_reference_source_import"),
-    JobKind.REFERENCE_MATCHING: JobTaskSpec("app.workers.tasks.process_reference_matching_run"),
-    JobKind.MORPHOLOGY: JobTaskSpec("app.workers.tasks.process_morphology_run"),
-    JobKind.NAYIRI_TRUSTED_LOOKUP: JobTaskSpec("app.workers.tasks.process_document_nayiri_lookup_run"),
+    JobKind.INGESTION: JobTaskSpec("app.workers.tasks.process_document_ingestion", "ingestion"),
+    JobKind.REFERENCE_IMPORT: JobTaskSpec("app.workers.tasks.process_reference_source_import", "evidence_io"),
+    JobKind.REFERENCE_MATCHING: JobTaskSpec("app.workers.tasks.process_reference_matching_run", "evidence_io"),
+    JobKind.MORPHOLOGY: JobTaskSpec("app.workers.tasks.process_morphology_run", "nlp_cpu"),
+    JobKind.NAYIRI_TRUSTED_LOOKUP: JobTaskSpec(
+        "app.workers.tasks.process_document_trusted_external_lookup_run",
+        "external_io",
+    ),
+    JobKind.DISCOVERY_BUILD: JobTaskSpec("app.workers.tasks.process_document_discovery_build", "discovery"),
 }
 
 
@@ -51,9 +56,11 @@ class JobOrchestrator:
             spec.task_name,
             args=args or [str(job_id)],
             kwargs=kwargs or {},
+            queue=spec.queue,
+            routing_key=spec.queue,
             task_id=str(job_id),
         )
-        logger.info("Enqueued %s job_id=%s", job_kind.value, job_id)
+        logger.info("Enqueued %s job_id=%s queue=%s", job_kind.value, job_id, spec.queue)
 
     def mark_running(
         self,
