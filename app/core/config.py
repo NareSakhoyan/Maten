@@ -59,7 +59,7 @@ class Settings(BaseSettings):
     )
 
     database_url: str = Field(alias="DATABASE_URL")
-    database_pool_pre_ping: bool = Field(default=False, alias="DATABASE_POOL_PRE_PING")
+    database_pool_pre_ping: bool = Field(default=True, alias="DATABASE_POOL_PRE_PING")
     database_pool_recycle_seconds: int = Field(default=1800, alias="DATABASE_POOL_RECYCLE_SECONDS", ge=-1)
 
     supabase_url: str = Field(alias="SUPABASE_URL")

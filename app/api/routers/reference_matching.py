@@ -8,7 +8,6 @@ from sqlalchemy.orm import Session
 from app.api.deps import get_db_session, require_admin_user
 from app.db.models import JobKind
 from app.services.job_orchestrator import get_job_orchestrator
-from app.db.models import JobKind
 from app.schemas.common import JobStageEventListResponse, JobStageEventRead
 from app.schemas.job import LongRunningJobRead
 from app.schemas.reference import (
