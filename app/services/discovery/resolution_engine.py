@@ -17,6 +17,9 @@ SUPPRESSED_RESOLUTION_STATUSES = {
     "attested_in_corpus",
     "resolved_by_lemma",
     "resolved_as_variant",
+    "poorly_defined",
+    "weakly_attested",
+    "needs_linguist_research",
     "probable_ocr_noise",
 }
 
@@ -226,13 +229,11 @@ class ResolutionEngine:
             evidence,
             match_types={"corpus_token_attestation", "corpus_lemma_attestation"},
             validation_strengths={ValidationStrength.SUPPORTS_WORD.value},
-            strengths={"strong"},
+            strengths={"strong", "medium", "weak"},
             provider_types={"corpus"},
-            language_profile=item.language_profile,
-            min_profile_weight=0.75,
         )
         if corpus_attestation is not None and ocr_risk_score < 0.45:
-            reasons.append("The form is strongly attested in the local Nayiri corpus, but not treated as dictionary-defined.")
+            reasons.append("The form is attested in the local Nayiri corpus.")
             return self._build_result(
                 "attested_in_corpus",
                 "attested_suppressed",
@@ -251,11 +252,11 @@ class ResolutionEngine:
             definition_qualities={"poor", "missing"},
         )
         if poor_definition is not None:
-            reasons.append("The form is attested, but the available definition is poor or missing.")
+            reasons.append("A source attests this form; definition quality is not used for linguist review.")
             return self._build_result(
                 "poorly_defined",
                 "poorly_defined",
-                75,
+                0,
                 item,
                 ocr_risk_score=ocr_risk_score,
                 morphology_score=morphology_score,
@@ -271,7 +272,9 @@ class ResolutionEngine:
             provider_types={"morphology"},
         )
         if morphology_only is not None and item.has_armenian and ocr_risk_score < 0.45:
-            reasons.append("Morphology can analyze this form, but no lexical source confirms it.")
+            reasons.append(
+                "Morphology can analyze this form; review it as a plausible Armenian form."
+            )
             return self._build_result(
                 "unknown_plausible",
                 "unknown_plausible",
@@ -332,17 +335,30 @@ class ResolutionEngine:
             },
         )
         if weak_evidence is not None:
-            reasons.append("The form has weak or limited attestation.")
+            reasons.append("The form has weak or limited attestation and is hidden from the default review queue.")
             return self._build_result(
                 "weakly_attested",
                 "weakly_attested",
-                65,
+                0,
                 item,
                 ocr_risk_score=ocr_risk_score,
                 morphology_score=morphology_score,
                 definition_score=definition_score,
                 reasons=reasons,
                 best_evidence=weak_evidence,
+            )
+
+        if dominant_script_type == OccurrenceScriptType.LATIN.value and not item.has_armenian:
+            reasons.append("The OCR token is Latin-only and outside the Armenian review scope.")
+            return self._build_result(
+                "probable_ocr_noise",
+                "noise_suppressed",
+                0,
+                item,
+                ocr_risk_score=max(ocr_risk_score, 0.75),
+                morphology_score=morphology_score,
+                definition_score=definition_score,
+                reasons=reasons,
             )
 
         if ocr_risk_score >= 0.75 and item.occurrence_count <= 1:
@@ -372,7 +388,9 @@ class ResolutionEngine:
             )
 
         if item.has_armenian and (item.occurrence_count > 1 or item.morphology_plausible):
-            reasons.append("The form is Armenian-looking, unresolved, and repeated or morphologically plausible.")
+            reasons.append(
+                "The form is Armenian-looking, unresolved, and repeated or morphologically plausible."
+            )
             return self._build_result(
                 "unknown_plausible",
                 "unknown_plausible",
@@ -384,11 +402,11 @@ class ResolutionEngine:
                 reasons=reasons,
             )
 
-        reasons.append("The form is unresolved and needs linguistic review.")
+        reasons.append("The form is unresolved and hidden from the default review queue.")
         return self._build_result(
             "needs_linguist_research",
             "needs_linguist_research",
-            60,
+            0,
             item,
             ocr_risk_score=ocr_risk_score,
             morphology_score=morphology_score,

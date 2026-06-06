@@ -60,6 +60,12 @@ celery_app.conf.update(
     worker_concurrency=settings.celery_worker_concurrency,
     worker_pool=settings.celery_worker_pool,
     worker_prefetch_multiplier=1,
+    beat_schedule={
+        "sweep-stale-jobs": {
+            "task": "app.workers.tasks.sweep_stale_jobs",
+            "schedule": float(settings.job_stale_sweep_interval_seconds),
+        },
+    },
 )
 
 install_celery_observability(celery_app)

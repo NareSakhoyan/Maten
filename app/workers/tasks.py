@@ -150,6 +150,23 @@ def process_morphology_run(run_id: str) -> dict[str, str]:
     return {"run_id": run_id, "status": "completed"}
 
 
+@celery_app.task(name="app.workers.tasks.sweep_stale_jobs")
+def sweep_stale_jobs() -> dict[str, int]:
+    from app.core.database import session_scope
+    from app.services.stale_job_recovery_service import get_stale_job_recovery_service
+
+    logger.info("Starting stale job sweep")
+    with session_scope() as session:
+        summary = get_stale_job_recovery_service().sweep_stale_jobs(session)
+    logger.info(
+        "Finished stale job sweep scanned=%s recovered=%s auto_retried=%s",
+        summary.scanned,
+        summary.recovered,
+        summary.auto_retried,
+    )
+    return summary.as_dict()
+
+
 @celery_app.task(name="app.workers.tasks.process_document_discovery_build")
 def process_document_discovery_build(run_id: str) -> dict[str, str]:
     from app.services.discovery.discovery_candidate_service import get_discovery_candidate_service

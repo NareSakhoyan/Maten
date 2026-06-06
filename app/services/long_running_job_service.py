@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from typing import Any
 from uuid import UUID
 
 from sqlalchemy import func, select
@@ -15,9 +16,22 @@ from app.db.models import (
     ReferenceSourceImport,
 )
 from app.schemas.job import LongRunningJobListResponse, LongRunningJobRead
+from app.services.auth_service import get_supabase_admin_client
+from app.services.stale_job_recovery_service import StaleJobRecoveryService, get_stale_job_recovery_service
+
+
+def _value_from_object(value: Any, key: str) -> Any:
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        return value.get(key)
+    return getattr(value, key, None)
 
 
 class LongRunningJobService:
+    def __init__(self, *, stale_job_recovery_service: StaleJobRecoveryService | None = None) -> None:
+        self.stale_job_recovery_service = stale_job_recovery_service or get_stale_job_recovery_service()
+
     def build_job_read(
         self,
         job: IngestionJob | ReferenceSourceImport | ReferenceMatchRun | MorphologyRun | DocumentNayiriLookupRun | DiscoveryBuildRun,
@@ -25,43 +39,80 @@ class LongRunningJobService:
         session: Session | None = None,
     ) -> LongRunningJobRead:
         if isinstance(job, IngestionJob):
-            return self._build_ingestion_job(session, job)
-        if isinstance(job, ReferenceSourceImport):
-            return self._build_reference_import_job(session, job)
-        if isinstance(job, ReferenceMatchRun):
-            return self._build_reference_matching_job(session, job)
-        if isinstance(job, MorphologyRun):
-            return self._build_morphology_job(session, job)
-        if isinstance(job, DocumentNayiriLookupRun):
-            return self._build_nayiri_lookup_job(session, job)
-        if isinstance(job, DiscoveryBuildRun):
-            return self._build_discovery_build_job(session, job)
-        raise TypeError(f"Unsupported job type: {type(job)!r}")
+            payload = self._build_ingestion_job(session, job)
+        elif isinstance(job, ReferenceSourceImport):
+            payload = self._build_reference_import_job(session, job)
+        elif isinstance(job, ReferenceMatchRun):
+            payload = self._build_reference_matching_job(session, job)
+        elif isinstance(job, MorphologyRun):
+            payload = self._build_morphology_job(session, job)
+        elif isinstance(job, DocumentNayiriLookupRun):
+            payload = self._build_nayiri_lookup_job(session, job)
+        elif isinstance(job, DiscoveryBuildRun):
+            payload = self._build_discovery_build_job(session, job)
+        else:
+            raise TypeError(f"Unsupported job type: {type(job)!r}")
 
-    def get_user_job(self, session: Session, *, user_id: UUID, job_id: UUID) -> LongRunningJobRead | None:
+        if session is not None:
+            return self._finalize_job_read(session, payload)
+        return payload
+
+    def get_user_job(
+        self,
+        session: Session,
+        *,
+        user_id: UUID,
+        job_id: UUID,
+        include_all_users: bool = False,
+        include_owner_profile: bool = False,
+    ) -> LongRunningJobRead | None:
         ingestion_job = session.get(IngestionJob, job_id)
-        if ingestion_job is not None and ingestion_job.user_id == user_id:
-            return self._build_ingestion_job(session, ingestion_job)
+        if ingestion_job is not None and (include_all_users or ingestion_job.user_id == user_id):
+            return self._finalize_job_read(
+                session,
+                self._with_owner_profile(self._build_ingestion_job(session, ingestion_job), include_owner_profile),
+            )
 
         reference_import = session.get(ReferenceSourceImport, job_id)
-        if reference_import is not None and reference_import.user_id == str(user_id):
-            return self._build_reference_import_job(session, reference_import)
+        if reference_import is not None and (include_all_users or reference_import.user_id == str(user_id)):
+            return self._finalize_job_read(
+                session,
+                self._with_owner_profile(self._build_reference_import_job(session, reference_import), include_owner_profile),
+            )
 
         reference_matching = session.get(ReferenceMatchRun, job_id)
-        if reference_matching is not None and reference_matching.user_id == str(user_id):
-            return self._build_reference_matching_job(session, reference_matching)
+        if reference_matching is not None and (include_all_users or reference_matching.user_id == str(user_id)):
+            return self._finalize_job_read(
+                session,
+                self._with_owner_profile(
+                    self._build_reference_matching_job(session, reference_matching),
+                    include_owner_profile,
+                ),
+            )
 
         morphology_run = session.get(MorphologyRun, job_id)
-        if morphology_run is not None and morphology_run.user_id == str(user_id):
-            return self._build_morphology_job(session, morphology_run)
+        if morphology_run is not None and (include_all_users or morphology_run.user_id == str(user_id)):
+            return self._finalize_job_read(
+                session,
+                self._with_owner_profile(self._build_morphology_job(session, morphology_run), include_owner_profile),
+            )
 
         nayiri_lookup_run = session.get(DocumentNayiriLookupRun, job_id)
-        if nayiri_lookup_run is not None and nayiri_lookup_run.user_id == str(user_id):
-            return self._build_nayiri_lookup_job(session, nayiri_lookup_run)
+        if nayiri_lookup_run is not None and (include_all_users or nayiri_lookup_run.user_id == str(user_id)):
+            return self._finalize_job_read(
+                session,
+                self._with_owner_profile(self._build_nayiri_lookup_job(session, nayiri_lookup_run), include_owner_profile),
+            )
 
         discovery_build_run = session.get(DiscoveryBuildRun, job_id)
-        if discovery_build_run is not None and discovery_build_run.user_id == str(user_id):
-            return self._build_discovery_build_job(session, discovery_build_run)
+        if discovery_build_run is not None and (include_all_users or discovery_build_run.user_id == str(user_id)):
+            return self._finalize_job_read(
+                session,
+                self._with_owner_profile(
+                    self._build_discovery_build_job(session, discovery_build_run),
+                    include_owner_profile,
+                ),
+            )
         return None
 
     def get_user_job_by_kind(
@@ -71,37 +122,57 @@ class LongRunningJobService:
         user_id: UUID,
         job_id: UUID,
         job_kind: JobKind,
+        include_all_users: bool = False,
+        include_owner_profile: bool = False,
     ) -> LongRunningJobRead | None:
         user_id_text = str(user_id)
         if job_kind is JobKind.INGESTION:
             job = session.get(IngestionJob, job_id)
-            if job is not None and job.user_id == user_id:
-                return self._build_ingestion_job(session, job)
+            if job is not None and (include_all_users or job.user_id == user_id):
+                return self._finalize_job_read(
+                    session,
+                    self._with_owner_profile(self._build_ingestion_job(session, job), include_owner_profile),
+                )
             return None
         if job_kind is JobKind.REFERENCE_IMPORT:
             job = session.get(ReferenceSourceImport, job_id)
-            if job is not None and job.user_id == user_id_text:
-                return self._build_reference_import_job(session, job)
+            if job is not None and (include_all_users or job.user_id == user_id_text):
+                return self._finalize_job_read(
+                    session,
+                    self._with_owner_profile(self._build_reference_import_job(session, job), include_owner_profile),
+                )
             return None
         if job_kind is JobKind.REFERENCE_MATCHING:
             job = session.get(ReferenceMatchRun, job_id)
-            if job is not None and job.user_id == user_id_text:
-                return self._build_reference_matching_job(session, job)
+            if job is not None and (include_all_users or job.user_id == user_id_text):
+                return self._finalize_job_read(
+                    session,
+                    self._with_owner_profile(self._build_reference_matching_job(session, job), include_owner_profile),
+                )
             return None
         if job_kind is JobKind.MORPHOLOGY:
             job = session.get(MorphologyRun, job_id)
-            if job is not None and job.user_id == user_id_text:
-                return self._build_morphology_job(session, job)
+            if job is not None and (include_all_users or job.user_id == user_id_text):
+                return self._finalize_job_read(
+                    session,
+                    self._with_owner_profile(self._build_morphology_job(session, job), include_owner_profile),
+                )
             return None
         if job_kind is JobKind.NAYIRI_TRUSTED_LOOKUP:
             job = session.get(DocumentNayiriLookupRun, job_id)
-            if job is not None and job.user_id == user_id_text:
-                return self._build_nayiri_lookup_job(session, job)
+            if job is not None and (include_all_users or job.user_id == user_id_text):
+                return self._finalize_job_read(
+                    session,
+                    self._with_owner_profile(self._build_nayiri_lookup_job(session, job), include_owner_profile),
+                )
             return None
         if job_kind is JobKind.DISCOVERY_BUILD:
             job = session.get(DiscoveryBuildRun, job_id)
-            if job is not None and job.user_id == user_id_text:
-                return self._build_discovery_build_job(session, job)
+            if job is not None and (include_all_users or job.user_id == user_id_text):
+                return self._finalize_job_read(
+                    session,
+                    self._with_owner_profile(self._build_discovery_build_job(session, job), include_owner_profile),
+                )
             return None
         return None
 
@@ -114,71 +185,63 @@ class LongRunningJobService:
         offset: int,
         job_kind: JobKind | None = None,
         status: str | None = None,
+        include_all_users: bool = False,
+        include_owner_profile: bool = False,
     ) -> tuple[list[LongRunningJobRead], int]:
         jobs: list[LongRunningJobRead] = []
         total = 0
 
         if job_kind in {None, JobKind.INGESTION}:
-            filters = [IngestionJob.user_id == user_id]
+            filters = [] if include_all_users else [IngestionJob.user_id == user_id]
             if status:
                 filters.append(IngestionJob.status == status)
             total += session.scalar(select(func.count(IngestionJob.id)).where(*filters)) or 0
-            jobs.extend(
-                self._build_ingestion_job(session, job)
-                for job in session.scalars(select(IngestionJob).where(*filters))
-            )
+            for job in session.scalars(select(IngestionJob).where(*filters)):
+                jobs.append(self._build_ingestion_job(session, job))
 
         if job_kind in {None, JobKind.REFERENCE_IMPORT}:
-            filters = [ReferenceSourceImport.user_id == str(user_id)]
+            filters = [] if include_all_users else [ReferenceSourceImport.user_id == str(user_id)]
             if status:
                 filters.append(ReferenceSourceImport.status == status)
             total += session.scalar(select(func.count(ReferenceSourceImport.id)).where(*filters)) or 0
-            jobs.extend(
-                self._build_reference_import_job(session, job)
-                for job in session.scalars(select(ReferenceSourceImport).where(*filters))
-            )
+            for job in session.scalars(select(ReferenceSourceImport).where(*filters)):
+                jobs.append(self._build_reference_import_job(session, job))
 
         if job_kind in {None, JobKind.REFERENCE_MATCHING}:
-            filters = [ReferenceMatchRun.user_id == str(user_id)]
+            filters = [] if include_all_users else [ReferenceMatchRun.user_id == str(user_id)]
             if status:
                 filters.append(ReferenceMatchRun.status == status)
             total += session.scalar(select(func.count(ReferenceMatchRun.id)).where(*filters)) or 0
-            jobs.extend(
-                self._build_reference_matching_job(session, job)
-                for job in session.scalars(select(ReferenceMatchRun).where(*filters))
-            )
+            for job in session.scalars(select(ReferenceMatchRun).where(*filters)):
+                jobs.append(self._build_reference_matching_job(session, job))
 
         if job_kind in {None, JobKind.MORPHOLOGY}:
-            filters = [MorphologyRun.user_id == str(user_id)]
+            filters = [] if include_all_users else [MorphologyRun.user_id == str(user_id)]
             if status:
                 filters.append(MorphologyRun.status == status)
             total += session.scalar(select(func.count(MorphologyRun.id)).where(*filters)) or 0
-            jobs.extend(
-                self._build_morphology_job(session, job)
-                for job in session.scalars(select(MorphologyRun).where(*filters))
-            )
+            for job in session.scalars(select(MorphologyRun).where(*filters)):
+                jobs.append(self._build_morphology_job(session, job))
 
         if job_kind in {None, JobKind.NAYIRI_TRUSTED_LOOKUP}:
-            filters = [DocumentNayiriLookupRun.user_id == str(user_id)]
+            filters = [] if include_all_users else [DocumentNayiriLookupRun.user_id == str(user_id)]
             if status:
                 filters.append(DocumentNayiriLookupRun.status == status)
             total += session.scalar(select(func.count(DocumentNayiriLookupRun.id)).where(*filters)) or 0
-            jobs.extend(
-                self._build_nayiri_lookup_job(session, job)
-                for job in session.scalars(select(DocumentNayiriLookupRun).where(*filters))
-            )
+            for job in session.scalars(select(DocumentNayiriLookupRun).where(*filters)):
+                jobs.append(self._build_nayiri_lookup_job(session, job))
 
         if job_kind in {None, JobKind.DISCOVERY_BUILD}:
-            filters = [DiscoveryBuildRun.user_id == str(user_id)]
+            filters = [] if include_all_users else [DiscoveryBuildRun.user_id == str(user_id)]
             if status:
                 filters.append(DiscoveryBuildRun.status == status)
             total += session.scalar(select(func.count(DiscoveryBuildRun.id)).where(*filters)) or 0
-            jobs.extend(
-                self._build_discovery_build_job(session, job)
-                for job in session.scalars(select(DiscoveryBuildRun).where(*filters))
-            )
+            for job in session.scalars(select(DiscoveryBuildRun).where(*filters)):
+                jobs.append(self._build_discovery_build_job(session, job))
 
+        jobs = [self._finalize_job_read(session, job) for job in jobs]
         jobs.sort(key=lambda item: (item.created_at, item.id), reverse=True)
+        self._attach_owner_profiles(jobs, enabled=include_owner_profile)
         return jobs[offset:offset + limit], total
 
     def list_active_jobs(
@@ -201,7 +264,8 @@ class LongRunningJobService:
             .order_by(IngestionJob.created_at.desc(), IngestionJob.id.desc())
             .limit(per_kind_limit)
         )
-        jobs.extend(self._build_ingestion_job(session, job) for job in ingestion_jobs)
+        for job in ingestion_jobs:
+            jobs.append(self._build_ingestion_job(session, job))
 
         reference_imports = session.scalars(
             select(ReferenceSourceImport)
@@ -212,7 +276,8 @@ class LongRunningJobService:
             .order_by(ReferenceSourceImport.created_at.desc(), ReferenceSourceImport.id.desc())
             .limit(per_kind_limit)
         )
-        jobs.extend(self._build_reference_import_job(session, job) for job in reference_imports)
+        for job in reference_imports:
+            jobs.append(self._build_reference_import_job(session, job))
 
         reference_matching = session.scalars(
             select(ReferenceMatchRun)
@@ -223,7 +288,8 @@ class LongRunningJobService:
             .order_by(ReferenceMatchRun.created_at.desc(), ReferenceMatchRun.id.desc())
             .limit(per_kind_limit)
         )
-        jobs.extend(self._build_reference_matching_job(session, job) for job in reference_matching)
+        for job in reference_matching:
+            jobs.append(self._build_reference_matching_job(session, job))
 
         morphology_runs = session.scalars(
             select(MorphologyRun)
@@ -234,7 +300,8 @@ class LongRunningJobService:
             .order_by(MorphologyRun.created_at.desc(), MorphologyRun.id.desc())
             .limit(per_kind_limit)
         )
-        jobs.extend(self._build_morphology_job(session, job) for job in morphology_runs)
+        for job in morphology_runs:
+            jobs.append(self._build_morphology_job(session, job))
 
         nayiri_lookup_runs = session.scalars(
             select(DocumentNayiriLookupRun)
@@ -245,7 +312,8 @@ class LongRunningJobService:
             .order_by(DocumentNayiriLookupRun.created_at.desc(), DocumentNayiriLookupRun.id.desc())
             .limit(per_kind_limit)
         )
-        jobs.extend(self._build_nayiri_lookup_job(session, job) for job in nayiri_lookup_runs)
+        for job in nayiri_lookup_runs:
+            jobs.append(self._build_nayiri_lookup_job(session, job))
 
         discovery_build_runs = session.scalars(
             select(DiscoveryBuildRun)
@@ -256,8 +324,10 @@ class LongRunningJobService:
             .order_by(DiscoveryBuildRun.created_at.desc(), DiscoveryBuildRun.id.desc())
             .limit(per_kind_limit)
         )
-        jobs.extend(self._build_discovery_build_job(session, job) for job in discovery_build_runs)
+        for job in discovery_build_runs:
+            jobs.append(self._build_discovery_build_job(session, job))
 
+        jobs = [self._finalize_job_read(session, job) for job in jobs]
         jobs.sort(key=lambda item: (item.created_at, item.id), reverse=True)
         return jobs[:limit]
 
@@ -324,10 +394,56 @@ class LongRunningJobService:
         )
         return int(total or 0)
 
+    def _finalize_job_read(self, session: Session, job: LongRunningJobRead) -> LongRunningJobRead:
+        return self.stale_job_recovery_service.enrich_job_read(session, job)
+
+    def _with_owner_profile(self, job: LongRunningJobRead, enabled: bool) -> LongRunningJobRead:
+        self._attach_owner_profiles([job], enabled=enabled)
+        return job
+
+    def _attach_owner_profiles(self, jobs: list[LongRunningJobRead], *, enabled: bool) -> None:
+        if not enabled or not jobs:
+            return
+
+        profiles = {user_id: self._resolve_owner_profile(user_id) for user_id in {job.user_id for job in jobs}}
+        for job in jobs:
+            profile = profiles.get(job.user_id) or {}
+            job.owner_email = profile.get("email")
+            job.owner_display_name = profile.get("display_name") or job.owner_email or job.user_id
+
+    @staticmethod
+    def _resolve_owner_profile(user_id: str) -> dict[str, str | None]:
+        try:
+            response = get_supabase_admin_client().auth.admin.get_user_by_id(user_id)
+        except Exception:
+            return {"email": None, "display_name": user_id}
+
+        payload = _value_from_object(response, "user") or _value_from_object(
+            _value_from_object(response, "data"),
+            "user",
+        )
+        email = _value_from_object(payload, "email")
+        metadata = _value_from_object(payload, "user_metadata") or {}
+        display_name = (
+            _value_from_object(metadata, "full_name")
+            or _value_from_object(metadata, "name")
+            or _value_from_object(metadata, "user_name")
+            or email
+            or user_id
+        )
+        return {
+            "email": str(email) if email else None,
+            "display_name": str(display_name) if display_name else user_id,
+        }
+
     @staticmethod
     def _build_ingestion_job(session: Session | None, job: IngestionJob) -> LongRunningJobRead:
         latest_retry_job_id: UUID | None = None
         latest_retry_job_status: str | None = None
+        latest_resume_job_id: UUID | None = None
+        latest_resume_job_status: str | None = None
+        can_resume: bool | None = None
+        resume_from_page: int | None = job.resume_from_page
         if session is not None:
             latest_retry_job = session.scalar(
                 select(IngestionJob)
@@ -338,14 +454,36 @@ class LongRunningJobService:
             if latest_retry_job is not None:
                 latest_retry_job_id = latest_retry_job.id
                 latest_retry_job_status = latest_retry_job.status.value
+
+            latest_resume_job = session.scalar(
+                select(IngestionJob)
+                .where(IngestionJob.resume_of_job_id == job.id)
+                .order_by(IngestionJob.created_at.desc(), IngestionJob.id.desc())
+                .limit(1)
+            )
+            if latest_resume_job is not None:
+                latest_resume_job_id = latest_resume_job.id
+                latest_resume_job_status = latest_resume_job.status.value
+
+            from app.services.ingestion_job_service import get_ingestion_job_service
+
+            ingestion_job_service = get_ingestion_job_service()
+            can_resume = ingestion_job_service.can_resume_job(session, job)
+            if can_resume:
+                resume_from_page = ingestion_job_service.compute_resume_from_page(job)
         return LongRunningJobRead(
             id=job.id,
             job_kind=JobKind.INGESTION,
             user_id=str(job.user_id),
             status=job.status.value,
             can_retry=job.can_retry,
+            can_resume=can_resume,
+            resume_from_page=resume_from_page,
+            resume_of_job_id=job.resume_of_job_id,
             latest_retry_job_id=latest_retry_job_id,
             latest_retry_job_status=latest_retry_job_status,
+            latest_resume_job_id=latest_resume_job_id,
+            latest_resume_job_status=latest_resume_job_status,
             current_stage_code=job.current_stage_code,
             current_stage_label=job.current_stage_label,
             stage_message_user=job.stage_message_user,

@@ -9,6 +9,7 @@ from sqlalchemy.orm import joinedload
 
 from app.core.database import session_scope
 from app.db.models import Document, DocumentPage, DocumentStatus, IngestionJob, IngestionJobStatus, JobKind, Occurrence
+from app.services.document_service import DocumentService
 from app.services.ingestion_error_service import IngestionErrorService, get_ingestion_error_service
 from app.services.job_orchestrator import get_job_orchestrator
 from app.services.job_progress_service import JobProgressService, get_job_progress_service
@@ -62,8 +63,14 @@ class IngestionService:
                 job.can_retry = True
                 job.started_at = datetime.now(timezone.utc)
                 job.finished_at = None
-                job.items_processed = 0
-                job.items_total = None
+                resume_from_page = job.resume_from_page
+                is_resume_job = resume_from_page is not None
+                if is_resume_job:
+                    processed_pages = max(resume_from_page - 1, 0)
+                    job.items_processed = processed_pages
+                else:
+                    job.items_processed = 0
+                job.items_total = job.items_total if is_resume_job else None
 
                 document.status = DocumentStatus.PROCESSING
                 from app.services.document_workflow_service import get_document_workflow_service
@@ -100,13 +107,23 @@ class IngestionService:
             with session_scope() as session:
                 job = self._load_job(session, job_uuid)
                 document = job.document
-                index_service.clear_document_index(
-                    session,
-                    user_id=document.user_id,
-                    document_id=document.id,
-                )
-                session.execute(delete(Occurrence).where(Occurrence.document_id == document.id))
-                session.execute(delete(DocumentPage).where(DocumentPage.document_id == document.id))
+                resume_from_page = job.resume_from_page
+                is_resume_job = resume_from_page is not None
+                if is_resume_job:
+                    session.execute(
+                        delete(DocumentPage).where(
+                            DocumentPage.document_id == document.id,
+                            DocumentPage.page_number >= resume_from_page,
+                        )
+                    )
+                else:
+                    index_service.clear_document_index(
+                        session,
+                        user_id=document.user_id,
+                        document_id=document.id,
+                    )
+                    session.execute(delete(Occurrence).where(Occurrence.document_id == document.id))
+                    session.execute(delete(DocumentPage).where(DocumentPage.document_id == document.id))
 
                 mime_type = detect_mime_type(document.original_filename, original_bytes, document.mime_type)
                 self.job_progress_service.set_stage(
@@ -120,22 +137,32 @@ class IngestionService:
                 page_count, page_iterator = self.page_extraction_service.iter_document_pages(
                     original_bytes,
                     mime_type,
+                    start_page=resume_from_page or 1,
                 )
                 document.page_count = page_count
                 job.items_total = page_count
+                initial_processed = max(resume_from_page - 1, 0) if is_resume_job else 0
                 self.job_progress_service.update_progress(
                     session,
                     job_kind=JobKind.INGESTION,
                     job=job,
-                    items_processed=0,
+                    items_processed=initial_processed,
                     items_total=page_count,
                 )
 
             if page_iterator is None:
                 raise RuntimeError(f"Could not initialize extraction for job {job_uuid}.")
 
-            processed_pages = 0
+            with session_scope() as session:
+                job = self._load_job(session, job_uuid)
+                resume_from_page = job.resume_from_page
+                is_resume_job = resume_from_page is not None
+
+            processed_pages = max(resume_from_page - 1, 0) if is_resume_job else 0
+            affected_index_forms: set[str] = set()
             for extracted_page in page_iterator:
+                if is_resume_job and extracted_page.page_number < resume_from_page:
+                    continue
                 with session_scope() as session:
                     job = self._load_job(session, job_uuid)
                     document = job.document
@@ -240,13 +267,16 @@ class IngestionService:
                         page_number=page.page_number,
                         text=page.reconstructed_text or page.extracted_text,
                     )
-                    index_service.apply_page_occurrences(
-                        session,
-                        user_id=document.user_id,
-                        document_id=document.id,
-                        document_title=document.title,
-                        page_id=page.id,
-                        occurrences=occurrences,
+                    affected_index_forms.update(
+                        index_service.apply_page_occurrences(
+                            session,
+                            user_id=document.user_id,
+                            document_id=document.id,
+                            document_title=document.title,
+                            page_id=page.id,
+                            occurrences=occurrences,
+                            rebuild_global=False,
+                        )
                     )
 
                     processed_pages += 1
@@ -269,6 +299,44 @@ class IngestionService:
                         processed_pages,
                         page_count,
                         document.id,
+                    )
+
+            if is_resume_job:
+                with session_scope() as session:
+                    job = self._load_job(session, job_uuid)
+                    document = job.document
+                    self.job_progress_service.set_stage(
+                        session,
+                        job_kind=JobKind.INGESTION,
+                        job=job,
+                        stage_code="saving_results",
+                        progress_percent=90,
+                        items_processed=processed_pages,
+                        items_total=page_count,
+                    )
+                    index_service.rebuild_document(
+                        session,
+                        user_id=document.user_id,
+                        document_id=document.id,
+                        document_title=document.title,
+                    )
+            elif affected_index_forms:
+                with session_scope() as session:
+                    job = self._load_job(session, job_uuid)
+                    document = job.document
+                    self.job_progress_service.set_stage(
+                        session,
+                        job_kind=JobKind.INGESTION,
+                        job=job,
+                        stage_code="saving_results",
+                        progress_percent=90,
+                        items_processed=processed_pages,
+                        items_total=page_count,
+                    )
+                    index_service.rebuild_global_rows(
+                        session,
+                        user_id=document.user_id,
+                        normalized_forms=list(affected_index_forms),
                     )
 
             with session_scope() as session:
@@ -392,7 +460,11 @@ class IngestionService:
                 message_user=failure_info.error_message_user,
             )
             if job.document is not None:
-                job.document.status = DocumentStatus.FAILED
+                job.document.status = DocumentService._document_status_after_job_failure(
+                    session,
+                    document_id=job.document.id,
+                    failed_job_id=job.id,
+                )
                 from app.services.document_workflow_service import get_document_workflow_service
 
                 get_document_workflow_service().sync_for_document(

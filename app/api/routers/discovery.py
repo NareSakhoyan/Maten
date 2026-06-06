@@ -36,11 +36,17 @@ def build_document_discovery_queue(
     document_service: DocumentService = Depends(get_document_service),
     discovery_service: DiscoveryCandidateService = Depends(get_discovery_candidate_service),
 ) -> DiscoveryBuildStartResponse:
-    document = document_service.get_user_document(session, user_id=current_user.user_id, document_id=document_id)
+    is_admin = current_user.role == "admin"
+    document = document_service.get_user_document(
+        session,
+        user_id=current_user.user_id,
+        document_id=document_id,
+        include_all_users=is_admin,
+    )
     if document is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found.")
     try:
-        run = discovery_service.start_build_run(session, user_id=current_user.user_id, document_id=document_id)
+        run = discovery_service.start_build_run(session, user_id=document.user_id, document_id=document_id)
     except BackpressureLimitError as exc:
         raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=str(exc)) from exc
     except ValueError as exc:
@@ -61,13 +67,18 @@ def update_document_reference_evidence(
     document_service: DocumentService = Depends(get_document_service),
     discovery_service: DiscoveryCandidateService = Depends(get_discovery_candidate_service),
 ) -> DiscoveryBuildStartResponse:
-    document = document_service.get_user_document(session, user_id=current_user.user_id, document_id=document_id)
+    document = document_service.get_user_document(
+        session,
+        user_id=current_user.user_id,
+        document_id=document_id,
+        include_all_users=True,
+    )
     if document is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found.")
     try:
         run = discovery_service.start_reference_evidence_refresh_run(
             session,
-            user_id=current_user.user_id,
+            user_id=document.user_id,
             document_id=document_id,
             reference_source_id=reference_source_id,
         )
@@ -95,18 +106,24 @@ def list_document_discovery_candidates(
     include_suppressed: bool = Query(default=False),
     limit: int = Query(default=20, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
-    sort: str = Query(default="interest_score_desc"),
+    sort: str = Query(default="occurrence_count_asc"),
     current_user: AuthenticatedUser = Depends(get_current_user),
     session: Session = Depends(get_db_session),
     document_service: DocumentService = Depends(get_document_service),
     discovery_service: DiscoveryCandidateService = Depends(get_discovery_candidate_service),
 ) -> DiscoveryCandidateListResponse:
-    document = document_service.get_user_document(session, user_id=current_user.user_id, document_id=document_id)
+    is_admin = current_user.role == "admin"
+    document = document_service.get_user_document(
+        session,
+        user_id=current_user.user_id,
+        document_id=document_id,
+        include_all_users=is_admin,
+    )
     if document is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found.")
     items, total = discovery_service.list_candidates(
         session,
-        user_id=current_user.user_id,
+        user_id=document.user_id,
         document_id=document_id,
         search=search,
         candidate_type=candidate_type,
@@ -134,10 +151,16 @@ def get_document_discovery_summary(
     document_service: DocumentService = Depends(get_document_service),
     discovery_service: DiscoveryCandidateService = Depends(get_discovery_candidate_service),
 ) -> DiscoverySummaryResponse:
-    document = document_service.get_user_document(session, user_id=current_user.user_id, document_id=document_id)
+    is_admin = current_user.role == "admin"
+    document = document_service.get_user_document(
+        session,
+        user_id=current_user.user_id,
+        document_id=document_id,
+        include_all_users=is_admin,
+    )
     if document is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found.")
-    return discovery_service.get_summary(session, user_id=current_user.user_id, document_id=document_id)
+    return discovery_service.get_summary(session, user_id=document.user_id, document_id=document_id)
 
 
 @router.get("/candidates/{candidate_id}", response_model=DiscoveryCandidateDetailResponse)
@@ -148,11 +171,21 @@ def get_document_discovery_candidate(
     include_raw_payload: bool = Query(default=False),
     current_user: AuthenticatedUser = Depends(get_current_user),
     session: Session = Depends(get_db_session),
+    document_service: DocumentService = Depends(get_document_service),
     discovery_service: DiscoveryCandidateService = Depends(get_discovery_candidate_service),
 ) -> DiscoveryCandidateDetailResponse:
-    payload = discovery_service.get_candidate_detail(
+    is_admin = current_user.role == "admin"
+    document = document_service.get_user_document(
         session,
         user_id=current_user.user_id,
+        document_id=document_id,
+        include_all_users=is_admin,
+    )
+    if document is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found.")
+    payload = discovery_service.get_candidate_detail(
+        session,
+        user_id=document.user_id,
         document_id=document_id,
         candidate_id=candidate_id,
     )
@@ -194,12 +227,22 @@ def decide_document_discovery_candidate(
     request: DiscoveryCandidateDecisionRequest,
     current_user: AuthenticatedUser = Depends(get_current_user),
     session: Session = Depends(get_db_session),
+    document_service: DocumentService = Depends(get_document_service),
     discovery_service: DiscoveryCandidateService = Depends(get_discovery_candidate_service),
 ) -> DiscoveryCandidateDecisionResponse:
+    is_admin = current_user.role == "admin"
+    document = document_service.get_user_document(
+        session,
+        user_id=current_user.user_id,
+        document_id=document_id,
+        include_all_users=is_admin,
+    )
+    if document is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found.")
     try:
         candidate = discovery_service.record_decision(
             session,
-            user_id=current_user.user_id,
+            user_id=document.user_id,
             document_id=document_id,
             candidate_id=candidate_id,
             decision=request.decision,

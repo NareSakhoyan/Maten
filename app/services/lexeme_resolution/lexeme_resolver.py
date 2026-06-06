@@ -183,17 +183,81 @@ class LexemeResolver:
         language_profile: str = "unknown",
     ) -> dict[str, LexemeResolution]:
         analyses_by_form = morphological_analyses_by_form or {}
+        normalized_forms = list(dict.fromkeys(normalize_token(form) for form in forms if normalize_token(form)))
+        approved_mapping_candidates = self._approved_mapping_candidates(
+            session,
+            user_id=user_id,
+            normalized_forms=normalized_forms,
+            language_profile=language_profile,
+        )
+        curated_lexeme_candidates = self._curated_lexeme_form_candidates(
+            session,
+            user_id=user_id,
+            normalized_forms=normalized_forms,
+        )
+        imported_reference_candidates = self._imported_reference_candidates(
+            session,
+            user_id=user_id,
+            normalized_forms=normalized_forms,
+        )
+
         return {
-            form: self.resolve(
-                session,
-                user_id=user_id,
+            form: self._build_resolution(
                 surface_form=form,
-                normalized_form=form,
-                morphological_analyses=analyses_by_form.get(form, []),
-                language_profile=language_profile,
+                normalized_form=normalize_token(form),
+                analyses=analyses_by_form.get(form, []),
+                selected=(
+                    approved_mapping_candidates.get(normalize_token(form))
+                    or curated_lexeme_candidates.get(normalize_token(form))
+                    or imported_reference_candidates.get(normalize_token(form))
+                ),
             )
             for form in forms
         }
+
+    @staticmethod
+    def _build_resolution(
+        *,
+        surface_form: str,
+        normalized_form: str,
+        analyses: list[MorphologyEvidence],
+        selected: DictionaryLemmaCandidate | None,
+        ocr_correction_candidates: list[OcrCorrectionCandidate] | None = None,
+    ) -> LexemeResolution:
+        morphological_lemma = LexemeResolver._primary_morphological_lemma(analyses)
+        notes: list[str] = []
+
+        resolution_type = "unresolved"
+        dictionary_lemma = None
+        dictionary_lemma_source = None
+        confidence = None
+        candidates: list[DictionaryLemmaCandidate] = []
+        if selected is not None:
+            dictionary_lemma = selected.lemma
+            dictionary_lemma_source = selected.source
+            confidence = selected.confidence
+            resolution_type = selected.resolution_type
+            candidates.append(selected)
+            if resolution_type == "resolved_by_approved_lexeme_mapping":
+                notes.append("Resolved by approved lexeme mapping.")
+        elif morphological_lemma:
+            confidence = LexemeResolver._primary_morphological_confidence(analyses)
+            resolution_type = "morphology_fallback_only"
+            notes.append("PIE/DALiH lemma retained as morphology fallback only; it is not dictionary canonicalization.")
+
+        return LexemeResolution(
+            surface_form=surface_form,
+            normalized_form=normalized_form,
+            morphological_lemma=morphological_lemma,
+            dictionary_lemma=dictionary_lemma,
+            dictionary_lemma_source=dictionary_lemma_source,
+            confidence=confidence,
+            resolution_type=resolution_type,
+            notes=notes,
+            morphological_analyses=analyses,
+            dictionary_lemma_candidates=candidates,
+            ocr_correction_candidates=list(ocr_correction_candidates or []),
+        )
 
     @staticmethod
     def _approved_mapping_candidate(
@@ -246,6 +310,63 @@ class LexemeResolver:
         )
 
     @staticmethod
+    def _approved_mapping_candidates(
+        session: Session,
+        *,
+        user_id: UUID,
+        normalized_forms: list[str],
+        language_profile: str,
+    ) -> dict[str, DictionaryLemmaCandidate]:
+        if not normalized_forms:
+            return {}
+
+        profile_order = [language_profile, "mixed", "unknown"] if language_profile != "unknown" else ["unknown", "mixed"]
+        rows = session.scalars(
+            select(LexemeFormMapping).where(
+                LexemeFormMapping.normalized_surface_form.in_(normalized_forms),
+                LexemeFormMapping.review_status == APPROVED_MAPPING_REVIEW_STATUS,
+                or_(LexemeFormMapping.user_id.is_(None), LexemeFormMapping.user_id == str(user_id)),
+            )
+        ).all()
+        rows = [
+            row
+            for row in rows
+            if row.mapping_type != "ocr_correction_candidate"
+            and row.source_key not in {"fuzzy", "fuzzy_ocr", "ocr_correction_candidate"}
+        ]
+        ordered = sorted(
+            rows,
+            key=lambda row: (
+                row.normalized_surface_form,
+                0 if row.user_id == str(user_id) else 1,
+                profile_order.index(row.language_profile) if row.language_profile in profile_order else len(profile_order),
+                -(float(row.confidence) if row.confidence is not None else 0.0),
+                row.normalized_dictionary_lemma,
+            ),
+        )
+
+        candidates: dict[str, DictionaryLemmaCandidate] = {}
+        for row in ordered:
+            if row.normalized_surface_form in candidates:
+                continue
+            confidence = float(row.confidence) if row.confidence is not None else 0.9
+            candidates[row.normalized_surface_form] = DictionaryLemmaCandidate(
+                lemma=row.dictionary_lemma,
+                normalized_lemma=row.normalized_dictionary_lemma,
+                source=row.source_key or row.source_type,
+                confidence=confidence,
+                resolution_type="resolved_by_approved_lexeme_mapping",
+                raw_payload={
+                    "mapping_id": str(row.id),
+                    "mapping_type": row.mapping_type,
+                    "source_type": row.source_type,
+                    "language_profile": row.language_profile,
+                    "review_status": row.review_status,
+                },
+            )
+        return candidates
+
+    @staticmethod
     def _curated_lexeme_form_candidate(
         session: Session,
         *,
@@ -273,6 +394,40 @@ class LexemeResolver:
             resolution_type="resolved_by_curated_lexeme_form",
             raw_payload={"lexeme_form_id": str(row.id)},
         )
+
+    @staticmethod
+    def _curated_lexeme_form_candidates(
+        session: Session,
+        *,
+        user_id: UUID,
+        normalized_forms: list[str],
+    ) -> dict[str, DictionaryLemmaCandidate]:
+        if not normalized_forms:
+            return {}
+
+        rows = session.execute(
+            select(LexemeForm.normalized_form, Lexeme.canonical_form, Lexeme.canonical_normalized_form, LexemeForm.id)
+            .join(Lexeme, LexemeForm.lexeme_id == Lexeme.id)
+            .where(
+                Lexeme.user_id == str(user_id),
+                LexemeForm.user_id == str(user_id),
+                LexemeForm.normalized_form.in_(normalized_forms),
+            )
+            .order_by(LexemeForm.normalized_form.asc(), Lexeme.created_at.asc(), Lexeme.id.asc())
+        ).all()
+        candidates: dict[str, DictionaryLemmaCandidate] = {}
+        for row in rows:
+            if row.normalized_form in candidates:
+                continue
+            candidates[row.normalized_form] = DictionaryLemmaCandidate(
+                lemma=row.canonical_form,
+                normalized_lemma=row.canonical_normalized_form,
+                source="internal_curated_lexeme_forms",
+                confidence=1.0,
+                resolution_type="resolved_by_curated_lexeme_form",
+                raw_payload={"lexeme_form_id": str(row.id)},
+            )
+        return candidates
 
     @staticmethod
     def _imported_reference_candidate(
@@ -305,6 +460,44 @@ class LexemeResolver:
                 raw_payload={"reference_entry_id": str(entry.id), "source_id": str(entry.source_id)},
             )
         return None
+
+    @staticmethod
+    def _imported_reference_candidates(
+        session: Session,
+        *,
+        user_id: UUID,
+        normalized_forms: list[str],
+    ) -> dict[str, DictionaryLemmaCandidate]:
+        if not normalized_forms:
+            return {}
+
+        rows = session.scalars(
+            select(ReferenceEntry)
+            .join(ReferenceSource, ReferenceEntry.source_id == ReferenceSource.id)
+            .where(
+                ReferenceSource.user_id == str(user_id),
+                ReferenceSource.is_active.is_(True),
+                ReferenceEntry.normalized_form.in_(normalized_forms),
+            )
+            .order_by(ReferenceEntry.normalized_form.asc(), ReferenceSource.display_name.asc(), ReferenceEntry.surface_form.asc())
+        ).all()
+        candidates: dict[str, DictionaryLemmaCandidate] = {}
+        for entry in rows:
+            if entry.normalized_form in candidates:
+                continue
+            lemma = LexemeResolver._reference_dictionary_lemma(entry)
+            normalized_lemma = normalize_token(lemma) if lemma else ""
+            if not lemma or not normalized_lemma:
+                continue
+            candidates[entry.normalized_form] = DictionaryLemmaCandidate(
+                lemma=lemma,
+                normalized_lemma=normalized_lemma,
+                source="imported_reference",
+                confidence=0.85,
+                resolution_type="resolved_by_imported_reference_mapping",
+                raw_payload={"reference_entry_id": str(entry.id), "source_id": str(entry.source_id)},
+            )
+        return candidates
 
     @staticmethod
     def _reference_dictionary_lemma(entry: ReferenceEntry) -> str | None:

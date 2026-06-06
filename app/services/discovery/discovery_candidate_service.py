@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import logging
 from collections import Counter, defaultdict
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from uuid import UUID
 
-from sqlalchemy import and_, delete, func, select
+from sqlalchemy import and_, delete, func, or_, select
 from sqlalchemy.orm import Session
 
 from app.core.database import session_scope
@@ -70,13 +71,20 @@ from app.utils.token_classification import classify_token
 from app.utils.snippets import context_snippet_highlight_range
 
 
+logger = logging.getLogger(__name__)
+
 SAMPLE_LIMIT = 5
+HIGH_FREQUENCY_PLAUSIBLE_MIN_OCCURRENCES = 4
+HIGH_FREQUENCY_PLAUSIBLE_MIN_PAGES = 6
 DEFAULT_HIDDEN_RESOLUTION_STATUSES = {
     "resolved_known",
     "resolved_by_dictionary",
     "attested_in_corpus",
     "resolved_by_lemma",
     "resolved_as_variant",
+    "poorly_defined",
+    "weakly_attested",
+    "needs_linguist_research",
     "probable_ocr_noise",
 }
 DEFAULT_HIDDEN_CANDIDATE_TYPES = {"known_suppressed", "attested_suppressed", "noise_suppressed"}
@@ -298,11 +306,10 @@ class DiscoveryCandidateService:
         try:
             with session_scope() as session:
                 run = self._load_run(session, run_uuid)
+
                 def stage_callback(stage_code: str, progress_percent: int) -> None:
-                    self.job_progress_service.set_stage(
-                        session,
-                        job_kind=JobKind.DISCOVERY_BUILD,
-                        job=run,
+                    self._commit_run_stage_checkpoint(
+                        run_uuid,
                         stage_code=stage_code,
                         progress_percent=progress_percent,
                     )
@@ -362,6 +369,34 @@ class DiscoveryCandidateService:
                     message_user=run.error_message_user,
                 )
             raise
+
+    def _commit_run_stage_checkpoint(
+        self,
+        run_id: UUID,
+        *,
+        stage_code: str,
+        progress_percent: int,
+    ) -> None:
+        try:
+            with session_scope() as session:
+                run = self._load_run(session, run_id)
+                if run.status not in (MorphologyRunStatus.QUEUED, MorphologyRunStatus.RUNNING):
+                    return
+                self.job_progress_service.set_stage(
+                    session,
+                    job_kind=JobKind.DISCOVERY_BUILD,
+                    job=run,
+                    stage_code=stage_code,
+                    progress_percent=progress_percent,
+                    force_event=True,
+                )
+        except Exception:
+            logger.warning(
+                "Failed to checkpoint discovery build progress run_id=%s stage_code=%s",
+                run_id,
+                stage_code,
+                exc_info=True,
+            )
 
     def build_for_document(
         self,
@@ -709,7 +744,7 @@ class DiscoveryCandidateService:
         include_suppressed: bool = False,
         limit: int,
         offset: int,
-        sort: str = "interest_score_desc",
+        sort: str = "occurrence_count_asc",
     ) -> tuple[list[DiscoveryCandidate], int]:
         filters = [
             DiscoveryCandidate.user_id == user_id,
@@ -730,15 +765,32 @@ class DiscoveryCandidateService:
                 [
                     DiscoveryCandidate.resolution_status.not_in(DEFAULT_HIDDEN_RESOLUTION_STATUSES),
                     DiscoveryCandidate.candidate_type.not_in(DEFAULT_HIDDEN_CANDIDATE_TYPES),
+                    self._has_armenian_occurrence_filter(),
+                    self._has_no_foreign_script_occurrence_filter(),
+                    self._exclude_high_frequency_plausible_filter(),
                 ]
             )
 
         total = session.scalar(select(func.count(DiscoveryCandidate.id)).where(*filters)) or 0
-        order_by = (
-            DiscoveryCandidate.normalized_form.asc()
-            if sort == "normalized_form_asc"
-            else DiscoveryCandidate.interest_score.desc()
-        )
+        sort_options = {
+            "normalized_form_asc": DiscoveryCandidate.normalized_form.asc(),
+            "normalized_form_desc": DiscoveryCandidate.normalized_form.desc(),
+            "occurrence_count_asc": DiscoveryCandidate.occurrence_count.asc(),
+            "occurrence_count_desc": DiscoveryCandidate.occurrence_count.desc(),
+            "page_count_asc": DiscoveryCandidate.page_count.asc(),
+            "page_count_desc": DiscoveryCandidate.page_count.desc(),
+            "candidate_type_asc": DiscoveryCandidate.candidate_type.asc(),
+            "candidate_type_desc": DiscoveryCandidate.candidate_type.desc(),
+            "resolution_status_asc": DiscoveryCandidate.resolution_status.asc(),
+            "resolution_status_desc": DiscoveryCandidate.resolution_status.desc(),
+            "ocr_risk_score_asc": DiscoveryCandidate.ocr_risk_score.asc(),
+            "ocr_risk_score_desc": DiscoveryCandidate.ocr_risk_score.desc(),
+            "interest_score_asc": DiscoveryCandidate.interest_score.asc(),
+            "interest_score_desc": DiscoveryCandidate.interest_score.desc(),
+            "review_status_asc": DiscoveryCandidate.review_status.asc(),
+            "review_status_desc": DiscoveryCandidate.review_status.desc(),
+        }
+        order_by = sort_options.get(sort, DiscoveryCandidate.occurrence_count.asc())
         items = list(
             session.scalars(
                 select(DiscoveryCandidate)
@@ -750,6 +802,48 @@ class DiscoveryCandidateService:
         )
         return items, total
 
+    @staticmethod
+    def _has_armenian_occurrence_filter():
+        return (
+            select(Occurrence.id)
+            .where(
+                Occurrence.document_id == DiscoveryCandidate.document_id,
+                Occurrence.normalized_token == DiscoveryCandidate.normalized_form,
+                Occurrence.has_armenian.is_(True),
+            )
+            .correlate(DiscoveryCandidate)
+            .exists()
+        )
+
+    @staticmethod
+    def _has_no_foreign_script_occurrence_filter():
+        return ~(
+            select(Occurrence.id)
+            .where(
+                Occurrence.document_id == DiscoveryCandidate.document_id,
+                Occurrence.normalized_token == DiscoveryCandidate.normalized_form,
+                Occurrence.script_type.in_(
+                    (
+                        OccurrenceScriptType.LATIN,
+                        OccurrenceScriptType.MIXED,
+                        OccurrenceScriptType.OTHER,
+                    )
+                ),
+            )
+            .correlate(DiscoveryCandidate)
+            .exists()
+        )
+
+    @staticmethod
+    def _exclude_high_frequency_plausible_filter():
+        return or_(
+            DiscoveryCandidate.resolution_status != "unknown_plausible",
+            and_(
+                DiscoveryCandidate.occurrence_count < HIGH_FREQUENCY_PLAUSIBLE_MIN_OCCURRENCES,
+                DiscoveryCandidate.page_count < HIGH_FREQUENCY_PLAUSIBLE_MIN_PAGES,
+            ),
+        )
+
     def get_summary(self, session: Session, *, user_id: UUID, document_id: UUID) -> DiscoverySummaryResponse:
         base_filters = [
             DiscoveryCandidate.user_id == user_id,
@@ -758,6 +852,9 @@ class DiscoveryCandidateService:
         visible_filter = and_(
             DiscoveryCandidate.resolution_status.not_in(DEFAULT_HIDDEN_RESOLUTION_STATUSES),
             DiscoveryCandidate.candidate_type.not_in(DEFAULT_HIDDEN_CANDIDATE_TYPES),
+            self._has_armenian_occurrence_filter(),
+            self._has_no_foreign_script_occurrence_filter(),
+            self._exclude_high_frequency_plausible_filter(),
         )
         counts_row = session.execute(
             select(

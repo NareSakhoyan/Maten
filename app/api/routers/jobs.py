@@ -9,9 +9,10 @@ from sqlalchemy.orm import Session
 from app.api.deps import get_current_user, get_db_session
 from app.db.models import JobKind
 from app.schemas.common import JobStageEventListResponse, JobStageEventRead
-from app.schemas.job import LongRunningJobListResponse, LongRunningJobRead, RetryJobStartResponse
+from app.schemas.job import LongRunningJobListResponse, LongRunningJobRead, ResumeJobStartResponse, RetryJobStartResponse
 from app.services.auth_service import AuthenticatedUser
 from app.services.job_progress_service import JobProgressService, get_job_progress_service
+from app.services.job_resume_service import JobResumeService, get_job_resume_service
 from app.services.job_retry_service import JobRetryService, get_job_retry_service
 from app.services.job_stream_service import get_job_stream_service
 from app.services.long_running_job_service import LongRunningJobService, get_long_running_job_service
@@ -31,6 +32,7 @@ async def list_jobs(
     session: Session = Depends(get_db_session),
     long_running_job_service: LongRunningJobService = Depends(get_long_running_job_service),
 ) -> LongRunningJobListResponse:
+    is_admin = current_user.role == "admin"
     items, total = long_running_job_service.list_jobs(
         session,
         user_id=current_user.user_id,
@@ -38,6 +40,8 @@ async def list_jobs(
         offset=offset,
         job_kind=job_kind,
         status=status_filter,
+        include_all_users=is_admin,
+        include_owner_profile=is_admin,
     )
     return LongRunningJobListResponse(items=items, total=total, limit=limit, offset=offset)
 
@@ -49,7 +53,14 @@ async def get_job(
     session: Session = Depends(get_db_session),
     long_running_job_service: LongRunningJobService = Depends(get_long_running_job_service),
 ) -> LongRunningJobRead:
-    job = long_running_job_service.get_user_job(session, user_id=current_user.user_id, job_id=job_id)
+    is_admin = current_user.role == "admin"
+    job = long_running_job_service.get_user_job(
+        session,
+        user_id=current_user.user_id,
+        job_id=job_id,
+        include_all_users=is_admin,
+        include_owner_profile=is_admin,
+    )
     if job is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found.")
     return job
@@ -66,18 +77,23 @@ async def list_job_events(
     long_running_job_service: LongRunningJobService = Depends(get_long_running_job_service),
     job_progress_service: JobProgressService = Depends(get_job_progress_service),
 ) -> JobStageEventListResponse:
+    is_admin = current_user.role == "admin"
     if job_kind is not None:
         job = long_running_job_service.get_user_job_by_kind(
             session,
             user_id=current_user.user_id,
             job_id=job_id,
             job_kind=job_kind,
+            include_all_users=is_admin,
+            include_owner_profile=is_admin,
         )
     else:
         job = long_running_job_service.get_user_job(
             session,
             user_id=current_user.user_id,
             job_id=job_id,
+            include_all_users=is_admin,
+            include_owner_profile=is_admin,
         )
     if job is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found.")
@@ -85,7 +101,7 @@ async def list_job_events(
         session,
         job_kind=job.job_kind,
         job_id=job_id,
-        user_id=current_user.user_id,
+        user_id=job.user_id,
     )
     sliced_events = events[offset:offset + limit]
     return JobStageEventListResponse(
@@ -102,14 +118,22 @@ async def stream_job_progress(
     session: Session = Depends(get_db_session),
     long_running_job_service: LongRunningJobService = Depends(get_long_running_job_service),
 ) -> StreamingResponse:
-    job = long_running_job_service.get_user_job(session, user_id=current_user.user_id, job_id=job_id)
+    is_admin = current_user.role == "admin"
+    job = long_running_job_service.get_user_job(
+        session,
+        user_id=current_user.user_id,
+        job_id=job_id,
+        include_all_users=is_admin,
+        include_owner_profile=is_admin,
+    )
     if job is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found.")
+    job_owner_id = UUID(job.user_id)
 
     stream_service = get_job_stream_service()
 
     async def event_generator():
-        async for chunk in stream_service.stream(user_id=current_user.user_id, job_id=job_id):
+        async for chunk in stream_service.stream(user_id=job_owner_id, job_id=job_id):
             yield chunk
 
     return StreamingResponse(
@@ -128,12 +152,53 @@ async def retry_job(
     job_id: UUID,
     current_user: AuthenticatedUser = Depends(get_current_user),
     session: Session = Depends(get_db_session),
+    long_running_job_service: LongRunningJobService = Depends(get_long_running_job_service),
     job_retry_service: JobRetryService = Depends(get_job_retry_service),
 ) -> RetryJobStartResponse:
+    is_admin = current_user.role == "admin"
+    job = long_running_job_service.get_user_job(
+        session,
+        user_id=current_user.user_id,
+        job_id=job_id,
+        include_all_users=is_admin,
+    )
+    if job is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found.")
+
     try:
         return job_retry_service.retry_job(
             session,
-            user_id=current_user.user_id,
+            user_id=UUID(job.user_id),
+            job_id=job_id,
+        )
+    except RetryStartError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.message) from exc
+
+
+@router.post("/{job_id}/resume", response_model=ResumeJobStartResponse)
+async def resume_job(
+    job_id: UUID,
+    current_user: AuthenticatedUser = Depends(get_current_user),
+    session: Session = Depends(get_db_session),
+    long_running_job_service: LongRunningJobService = Depends(get_long_running_job_service),
+    job_resume_service: JobResumeService = Depends(get_job_resume_service),
+) -> ResumeJobStartResponse:
+    is_admin = current_user.role == "admin"
+    job = long_running_job_service.get_user_job(
+        session,
+        user_id=current_user.user_id,
+        job_id=job_id,
+        include_all_users=is_admin,
+    )
+    if job is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found.")
+    if job.job_kind is not JobKind.INGESTION:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Only ingestion jobs can be resumed.")
+
+    try:
+        return job_resume_service.resume_job(
+            session,
+            user_id=UUID(job.user_id),
             job_id=job_id,
         )
     except RetryStartError as exc:

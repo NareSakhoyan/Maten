@@ -60,8 +60,8 @@ class StubPageExtractionService:
         self.pages = pages
         self.ocr_service = SimpleNamespace(settings=SimpleNamespace(tesseract_lang="hye"))
 
-    def iter_document_pages(self, file_bytes: bytes, mime_type: str):
-        del file_bytes, mime_type
+    def iter_document_pages(self, file_bytes: bytes, mime_type: str, *, start_page: int = 1):
+        del file_bytes, mime_type, start_page
         return len(self.pages), iter(self.pages)
 
 

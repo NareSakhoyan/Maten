@@ -114,7 +114,7 @@ def test_lemma_match_is_resolved_by_lemma_and_suppressed() -> None:
     assert result.suppressed is True
 
 
-def test_poor_definition_stays_in_discovery_queue() -> None:
+def test_poor_definition_is_suppressed_when_source_attests_form() -> None:
     result = ResolutionEngine().resolve(
         _input(
             evidence=[
@@ -134,11 +134,11 @@ def test_poor_definition_stays_in_discovery_queue() -> None:
 
     assert result.resolution_status == "poorly_defined"
     assert result.candidate_type == "poorly_defined"
-    assert result.suppressed is False
-    assert result.interest_score > 75
+    assert result.suppressed is True
+    assert result.interest_score == 0
 
 
-def test_weak_attestation_stays_in_discovery_queue() -> None:
+def test_weak_corpus_attestation_is_suppressed_as_attested() -> None:
     result = ResolutionEngine().resolve(
         _input(
             evidence=[
@@ -156,9 +156,10 @@ def test_weak_attestation_stays_in_discovery_queue() -> None:
         )
     )
 
-    assert result.resolution_status == "weakly_attested"
-    assert result.candidate_type == "weakly_attested"
-    assert result.suppressed is False
+    assert result.resolution_status == "attested_in_corpus"
+    assert result.candidate_type == "attested_suppressed"
+    assert result.suppressed is True
+    assert result.interest_score == 0
 
 
 def test_named_entity_evidence_never_resolves_as_lexical_word() -> None:
@@ -235,6 +236,23 @@ def test_repeated_digit_mixed_form_is_possible_ocr_corruption() -> None:
     assert result.suppressed is False
 
 
+def test_repeated_latin_only_form_is_suppressed_as_noise() -> None:
+    result = ResolutionEngine().resolve(
+        _input(
+            normalized_form="lorem",
+            occurrence_count=8,
+            page_count=3,
+            dominant_script_type=OccurrenceScriptType.LATIN,
+            has_armenian=False,
+        )
+    )
+
+    assert result.resolution_status == "probable_ocr_noise"
+    assert result.candidate_type == "noise_suppressed"
+    assert result.suppressed is True
+    assert result.interest_score == 0
+
+
 def test_conflicting_sources_stay_in_discovery_queue() -> None:
     result = ResolutionEngine().resolve(
         _input(
@@ -292,10 +310,11 @@ def test_nayiri_page_fulltext_context_does_not_validate() -> None:
     )
 
     assert result.resolution_status in {"unknown_plausible", "needs_linguist_research"}
+    assert result.suppressed is True
     assert result.best_evidence_summary.get("validation_strength") != "validates_word"
 
 
-def test_profile_mismatched_corpus_does_not_suppress_as_attested() -> None:
+def test_profile_mismatched_corpus_still_suppresses_as_attested() -> None:
     result = ResolutionEngine().resolve(
         _input(
             language_profile="eastern",
@@ -317,8 +336,9 @@ def test_profile_mismatched_corpus_does_not_suppress_as_attested() -> None:
         )
     )
 
-    assert result.resolution_status != "attested_in_corpus"
-    assert result.suppressed is False
+    assert result.resolution_status == "attested_in_corpus"
+    assert result.candidate_type == "attested_suppressed"
+    assert result.suppressed is True
 
 
 def test_classical_profile_prefers_classical_provider_priority() -> None:

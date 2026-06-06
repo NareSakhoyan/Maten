@@ -1611,6 +1611,13 @@ class IngestionJob(UpdatedTimestampMixin, Base):
         nullable=True,
         index=True,
     )
+    resume_of_job_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("ingestion_jobs.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    resume_from_page: Mapped[int | None] = mapped_column(Integer, nullable=True)
     user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False, index=True)
     status: Mapped[IngestionJobStatus] = mapped_column(
         SqlEnum(

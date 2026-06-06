@@ -45,6 +45,7 @@ class Settings(BaseSettings):
     request_slow_error_ms: int = Field(default=5000, alias="REQUEST_SLOW_ERROR_MS", ge=0)
     sql_timing_enabled: bool = Field(default=True, alias="SQL_TIMING_ENABLED")
     sql_slow_query_ms: int = Field(default=200, alias="SQL_SLOW_QUERY_MS", ge=0)
+    sql_log_statement_max_chars: int = Field(default=240, alias="SQL_LOG_STATEMENT_MAX_CHARS", ge=0)
     otel_enabled: bool = Field(default=False, alias="OTEL_ENABLED")
     otel_service_name: str = Field(default="baghramyan-backend", alias="OTEL_SERVICE_NAME")
     api_host: str = Field(default="0.0.0.0", alias="API_HOST")
@@ -107,6 +108,9 @@ class Settings(BaseSettings):
     max_active_ocr_jobs_global: int = Field(default=1, alias="MAX_ACTIVE_OCR_JOBS_GLOBAL", ge=1)
     max_active_external_lookups_global: int = Field(default=1, alias="MAX_ACTIVE_EXTERNAL_LOOKUPS_GLOBAL", ge=1)
     external_lookup_stale_job_minutes: int = Field(default=30, alias="EXTERNAL_LOOKUP_STALE_JOB_MINUTES", ge=1)
+    job_stale_after_minutes: int = Field(default=30, alias="JOB_STALE_AFTER_MINUTES", ge=1)
+    job_stale_sweep_interval_seconds: int = Field(default=300, alias="JOB_STALE_SWEEP_INTERVAL_SECONDS", ge=60)
+    job_stale_auto_retry_limit: int = Field(default=1, alias="JOB_STALE_AUTO_RETRY_LIMIT", ge=0)
 
     tessdata_prefix: str | None = Field(default=None, alias="TESSDATA_PREFIX")
     tesseract_lang: str = Field(default="hye-calfa-n", alias="TESSERACT_LANG")

@@ -164,6 +164,52 @@ def test_incremental_page_index_without_full_rebuild(db_session: Session) -> Non
     assert slice_row.script_counts
 
 
+def test_page_index_can_defer_global_rebuild(db_session: Session) -> None:
+    document, page = _seed_document(db_session, title="Deferred Global")
+    index_service = LexiconGroupIndexService()
+    occurrences = OccurrenceService().store_page_occurrences(
+        db_session,
+        document_id=document.id,
+        page_id=page.id,
+        page_number=page.page_number,
+        text="Երևան",
+    )
+
+    affected_forms = index_service.apply_page_occurrences(
+        db_session,
+        user_id=PRIMARY_USER_ID,
+        document_id=document.id,
+        document_title=document.title,
+        page_id=page.id,
+        occurrences=occurrences,
+        rebuild_global=False,
+    )
+    db_session.flush()
+
+    normalized_form = occurrences[0].normalized_token
+    assert normalized_form in affected_forms
+    assert db_session.get(
+        LexiconGroupIndexDocument,
+        {
+            "user_id": PRIMARY_USER_ID,
+            "normalized_form": normalized_form,
+            "document_id": document.id,
+        },
+    ) is not None
+    assert db_session.get(LexiconGroupIndex, {"user_id": PRIMARY_USER_ID, "normalized_form": normalized_form}) is None
+
+    index_service.rebuild_global_rows(
+        db_session,
+        user_id=PRIMARY_USER_ID,
+        normalized_forms=affected_forms,
+    )
+    db_session.flush()
+
+    global_row = db_session.get(LexiconGroupIndex, {"user_id": PRIMARY_USER_ID, "normalized_form": normalized_form})
+    assert global_row is not None
+    assert global_row.occurrence_count >= 1
+
+
 def test_clear_document_index_removes_slices_and_updates_globals(db_session: Session) -> None:
     document, page = _seed_document(db_session, title="Clear Index")
     occurrences = OccurrenceService().store_page_occurrences(

@@ -205,11 +205,13 @@ async def list_documents(
     session: Session = Depends(get_db_session),
     document_service: DocumentService = Depends(get_document_service),
 ) -> DocumentListResponse:
+    is_admin = current_user.role == "admin"
     items, total = document_service.list_documents(
         session,
         user_id=current_user.user_id,
         limit=limit,
         offset=offset,
+        include_all_users=is_admin,
     )
     return DocumentListResponse(
         items=document_service.build_documents_read(
@@ -230,10 +232,12 @@ def get_document(
     session: Session = Depends(get_db_session),
     document_service: DocumentService = Depends(get_document_service),
 ) -> DocumentRead:
+    is_admin = current_user.role == "admin"
     document = document_service.get_user_document(
         session,
         user_id=current_user.user_id,
         document_id=document_id,
+        include_all_users=is_admin,
     )
     if document is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found.")
@@ -266,10 +270,12 @@ def list_document_pages(
     session: Session = Depends(get_db_session),
     document_service: DocumentService = Depends(get_document_service),
 ) -> DocumentPageListResponse:
+    is_admin = current_user.role == "admin"
     document = document_service.get_user_document(
         session,
         user_id=current_user.user_id,
         document_id=document_id,
+        include_all_users=is_admin,
     )
     if document is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found.")
@@ -280,6 +286,7 @@ def list_document_pages(
         document_id=document_id,
         limit=limit,
         offset=offset,
+        include_all_users=is_admin,
     )
     return DocumentPageListResponse(items=items, total=total, limit=limit, offset=offset)
 
@@ -293,10 +300,12 @@ def get_document_page_image(
     document_service: DocumentService = Depends(get_document_service),
     storage_service: StorageService = Depends(get_storage_service),
 ) -> StreamingResponse:
+    is_admin = current_user.role == "admin"
     document = document_service.get_user_document(
         session,
         user_id=current_user.user_id,
         document_id=document_id,
+        include_all_users=is_admin,
     )
     if document is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found.")
@@ -480,16 +489,18 @@ def get_document_morphology_summary(
     document_service: DocumentService = Depends(get_document_service),
     morphology_service: MorphologyService = Depends(get_morphology_service),
 ) -> MorphologySummaryResponse:
+    is_admin = current_user.role == "admin"
     document = document_service.get_user_document(
         session,
         user_id=current_user.user_id,
         document_id=document_id,
+        include_all_users=is_admin,
     )
     if document is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found.")
     return morphology_service.get_document_summary(
         session,
-        user_id=current_user.user_id,
+        user_id=document.user_id,
         document_id=document_id,
     )
 

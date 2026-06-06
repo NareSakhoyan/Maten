@@ -28,20 +28,32 @@ class PageExtractionService:
         self.settings = settings or get_settings()
         self.ocr_service = ocr_service or get_ocr_service()
 
-    def iter_document_pages(self, file_bytes: bytes, mime_type: str) -> tuple[int, Generator[ExtractedPage, None, None]]:
+    def iter_document_pages(
+        self,
+        file_bytes: bytes,
+        mime_type: str,
+        *,
+        start_page: int = 1,
+    ) -> tuple[int, Generator[ExtractedPage, None, None]]:
         if is_pdf_mime(mime_type):
-            return self._iter_pdf_pages(file_bytes)
+            return self._iter_pdf_pages(file_bytes, start_page=start_page)
         if is_image_mime(mime_type):
             return self._iter_image_page(file_bytes)
         raise ValueError(f"Unsupported file type for extraction: {mime_type}")
 
-    def _iter_pdf_pages(self, file_bytes: bytes) -> tuple[int, Generator[ExtractedPage, None, None]]:
+    def _iter_pdf_pages(
+        self,
+        file_bytes: bytes,
+        *,
+        start_page: int = 1,
+    ) -> tuple[int, Generator[ExtractedPage, None, None]]:
         pdf = fitz.open(stream=file_bytes, filetype="pdf")
         page_count = pdf.page_count
+        start_index = min(max(start_page, 1), page_count + 1) - 1
 
         def generator() -> Generator[ExtractedPage, None, None]:
             try:
-                for index in range(page_count):
+                for index in range(start_index, page_count):
                     page = pdf.load_page(index)
                     yield self._extract_pdf_page(page, index + 1)
             finally:

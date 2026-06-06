@@ -145,8 +145,6 @@ class DocumentService:
     ) -> None:
         document = session.get(Document, document_id)
         job = session.get(IngestionJob, job_id)
-        if document is not None:
-            document.status = DocumentStatus.FAILED
         if job is not None:
             job.status = IngestionJobStatus.FAILED
             job.error_message = failure_info.error_message_user
@@ -161,15 +159,59 @@ class DocumentService:
                 job=job,
                 message_user=failure_info.error_message_user,
             )
+        if document is not None:
+            document.status = self._document_status_after_job_failure(
+                session,
+                document_id=document_id,
+                failed_job_id=job_id,
+            )
         session.commit()
 
-    def get_user_document(self, session: Session, *, user_id: UUID, document_id: UUID) -> Document | None:
-        return session.scalar(
-            select(Document).where(
-                Document.id == document_id,
-                Document.user_id == user_id,
+    @staticmethod
+    def _document_status_after_job_failure(
+        session: Session,
+        *,
+        document_id: UUID,
+        failed_job_id: UUID,
+    ) -> DocumentStatus:
+        active_running_job_id = session.scalar(
+            select(IngestionJob.id)
+            .where(
+                IngestionJob.document_id == document_id,
+                IngestionJob.id != failed_job_id,
+                IngestionJob.status == IngestionJobStatus.RUNNING,
             )
+            .limit(1)
         )
+        if active_running_job_id is not None:
+            return DocumentStatus.PROCESSING
+
+        active_queued_job_id = session.scalar(
+            select(IngestionJob.id)
+            .where(
+                IngestionJob.document_id == document_id,
+                IngestionJob.id != failed_job_id,
+                IngestionJob.status == IngestionJobStatus.QUEUED,
+            )
+            .limit(1)
+        )
+        if active_queued_job_id is not None:
+            return DocumentStatus.QUEUED
+        return DocumentStatus.FAILED
+
+    def get_user_document(
+        self,
+        session: Session,
+        *,
+        user_id: UUID,
+        document_id: UUID,
+        include_all_users: bool = False,
+    ) -> Document | None:
+        filters = [Document.id == document_id]
+        if not include_all_users:
+            filters.append(Document.user_id == user_id)
+
+        return session.scalar(select(Document).where(*filters))
 
     def build_document_read(
         self,
@@ -180,12 +222,7 @@ class DocumentService:
         latest_job: IngestionJob | None = None,
     ) -> DocumentRead:
         if latest_job is None:
-            latest_job = session.scalar(
-                select(IngestionJob)
-                .where(IngestionJob.document_id == document.id)
-                .order_by(IngestionJob.created_at.desc(), IngestionJob.id.desc())
-                .limit(1)
-            )
+            latest_job = self._preferred_ingestion_job_for_document(session, document_id=document.id)
 
         updates: dict[str, object] = {
             "latest_job_id": latest_job.id if latest_job is not None else None,
@@ -235,30 +272,43 @@ class DocumentService:
         if not document_ids:
             return {}
 
-        latest_created = (
-            select(
-                IngestionJob.document_id.label("document_id"),
-                func.max(IngestionJob.created_at).label("max_created_at"),
-            )
-            .where(IngestionJob.document_id.in_(document_ids))
-            .group_by(IngestionJob.document_id)
-            .subquery()
-        )
         rows = session.scalars(
             select(IngestionJob)
-            .join(
-                latest_created,
-                (IngestionJob.document_id == latest_created.c.document_id)
-                & (IngestionJob.created_at == latest_created.c.max_created_at),
-            )
-            .order_by(IngestionJob.id.desc())
+            .where(IngestionJob.document_id.in_(document_ids))
+            .order_by(IngestionJob.created_at.desc(), IngestionJob.id.desc())
         ).all()
 
+        active_statuses = {IngestionJobStatus.QUEUED, IngestionJobStatus.RUNNING}
+        active_by_document: dict[UUID, IngestionJob] = {}
         latest_by_document: dict[UUID, IngestionJob] = {}
         for job in rows:
             if job.document_id not in latest_by_document:
                 latest_by_document[job.document_id] = job
+            if job.status in active_statuses and job.document_id not in active_by_document:
+                active_by_document[job.document_id] = job
+        latest_by_document.update(active_by_document)
         return latest_by_document
+
+    @staticmethod
+    def _preferred_ingestion_job_for_document(session: Session, *, document_id: UUID) -> IngestionJob | None:
+        active_job = session.scalar(
+            select(IngestionJob)
+            .where(
+                IngestionJob.document_id == document_id,
+                IngestionJob.status.in_([IngestionJobStatus.QUEUED, IngestionJobStatus.RUNNING]),
+            )
+            .order_by(IngestionJob.created_at.desc(), IngestionJob.id.desc())
+            .limit(1)
+        )
+        if active_job is not None:
+            return active_job
+
+        return session.scalar(
+            select(IngestionJob)
+            .where(IngestionJob.document_id == document_id)
+            .order_by(IngestionJob.created_at.desc(), IngestionJob.id.desc())
+            .limit(1)
+        )
 
     def list_document_options(
         self,
@@ -334,12 +384,21 @@ class DocumentService:
         session.refresh(document)
         return document
 
-    def list_documents(self, session: Session, *, user_id: UUID, limit: int, offset: int) -> tuple[list[Document], int]:
-        total = session.scalar(select(func.count(Document.id)).where(Document.user_id == user_id)) or 0
+    def list_documents(
+        self,
+        session: Session,
+        *,
+        user_id: UUID,
+        limit: int,
+        offset: int,
+        include_all_users: bool = False,
+    ) -> tuple[list[Document], int]:
+        filters = [] if include_all_users else [Document.user_id == user_id]
+        total = session.scalar(select(func.count(Document.id)).where(*filters)) or 0
         items = list(
             session.scalars(
                 select(Document)
-                .where(Document.user_id == user_id)
+                .where(*filters)
                 .order_by(Document.created_at.desc())
                 .limit(limit)
                 .offset(offset)
@@ -355,12 +414,17 @@ class DocumentService:
         document_id: UUID,
         limit: int,
         offset: int,
+        include_all_users: bool = False,
     ) -> tuple[list[DocumentPage], int]:
+        filters = [DocumentPage.document_id == document_id]
+        if not include_all_users:
+            filters.append(Document.user_id == user_id)
+
         total = (
             session.scalar(
                 select(func.count(DocumentPage.id))
                 .join(Document, DocumentPage.document_id == Document.id)
-                .where(DocumentPage.document_id == document_id, Document.user_id == user_id)
+                .where(*filters)
             )
             or 0
         )
@@ -368,7 +432,7 @@ class DocumentService:
             session.scalars(
                 select(DocumentPage)
                 .join(Document, DocumentPage.document_id == Document.id)
-                .where(DocumentPage.document_id == document_id, Document.user_id == user_id)
+                .where(*filters)
                 .order_by(DocumentPage.page_number.asc())
                 .limit(limit)
                 .offset(offset)

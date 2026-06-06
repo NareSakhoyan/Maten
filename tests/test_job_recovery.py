@@ -91,6 +91,39 @@ def test_failed_job_stores_user_safe_error_payload(db_session: Session) -> None:
     assert job.can_retry is False
 
 
+def test_failed_job_preserves_processing_document_when_another_ingestion_is_running(db_session: Session) -> None:
+    document_service = DocumentService()
+    error_service = IngestionErrorService()
+    document = _seed_document(db_session, status=DocumentStatus.PROCESSING)
+    failed_job = _seed_job(db_session, document=document)
+    _seed_job(db_session, document=document, status=IngestionJobStatus.RUNNING)
+    db_session.commit()
+
+    failure_info = error_service.map_exception(RuntimeError("database write failed"))
+    document_service.mark_job_failed(
+        db_session,
+        document_id=document.id,
+        job_id=failed_job.id,
+        failure_info=failure_info,
+    )
+
+    db_session.refresh(document)
+    assert document.status is DocumentStatus.PROCESSING
+
+
+def test_document_payload_prefers_active_ingestion_over_newer_failed_duplicate(db_session: Session) -> None:
+    document_service = DocumentService()
+    document = _seed_document(db_session, status=DocumentStatus.PROCESSING)
+    active_job = _seed_job(db_session, document=document, status=IngestionJobStatus.RUNNING)
+    _seed_job(db_session, document=document, status=IngestionJobStatus.FAILED)
+    db_session.commit()
+
+    payload = document_service.build_document_read(db_session, document)
+
+    assert payload.latest_job_id == active_job.id
+    assert payload.latest_job_status == "running"
+
+
 def test_retry_job_creates_new_job_row_and_links_history(db_session: Session) -> None:
     service = IngestionJobService(storage_service=StubStorageService())
     document = _seed_document(db_session)
@@ -131,6 +164,28 @@ def test_retry_job_rejects_non_retryable_failures(db_session: Session) -> None:
 
     assert exc_info.value.status_code == 409
     assert exc_info.value.message == "This failed job cannot be retried."
+
+
+def test_retry_job_rejects_active_retry_descendant_for_same_document(db_session: Session) -> None:
+    service = IngestionJobService(storage_service=StubStorageService())
+    document = _seed_document(db_session)
+    original_job = _seed_job(db_session, document=document, retry_count=0)
+    direct_retry = _seed_job(db_session, document=document, retry_count=1)
+    direct_retry.retry_of_job_id = original_job.id
+    active_descendant_retry = _seed_job(
+        db_session,
+        document=document,
+        status=IngestionJobStatus.RUNNING,
+        retry_count=2,
+    )
+    active_descendant_retry.retry_of_job_id = direct_retry.id
+    db_session.commit()
+
+    with pytest.raises(IngestionRetryError) as exc_info:
+        service.create_retry_job(db_session, user_id=PRIMARY_USER_ID, failed_job_id=original_job.id)
+
+    assert exc_info.value.status_code == 409
+    assert exc_info.value.message == "An ingestion job is already running for this document."
 
 
 def test_retry_job_rejects_another_users_job(db_session: Session) -> None:

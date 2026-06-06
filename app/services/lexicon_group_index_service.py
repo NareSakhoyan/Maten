@@ -73,6 +73,7 @@ class LexiconGroupIndexService:
         document_title: str,
         page_id: UUID,
         occurrences: list[Occurrence],
+        rebuild_global: bool = True,
     ) -> list[str]:
         if not occurrences:
             return []
@@ -93,12 +94,13 @@ class LexiconGroupIndexService:
             )
             affected_forms.append(normalized_form)
 
-        self.rebuild_global_rows(
-            session,
-            user_id=user_id,
-            normalized_forms=affected_forms,
-            titles_by_document_id={document_id: document_title},
-        )
+        if rebuild_global:
+            self.rebuild_global_rows(
+                session,
+                user_id=user_id,
+                normalized_forms=affected_forms,
+                titles_by_document_id={document_id: document_title},
+            )
         return affected_forms
 
     def load_user_script_counts(self, session: Session, *, user_id: UUID) -> dict[str, dict[str, int]]:

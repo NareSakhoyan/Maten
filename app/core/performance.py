@@ -52,7 +52,7 @@ def install_sql_timing(engine: Engine, settings: Settings) -> None:
             request_path_var.get(),
             duration_ms,
             cursor.rowcount,
-            _sanitize_statement(statement),
+            _sanitize_statement(statement, max_chars=settings.sql_log_statement_max_chars),
         )
 
 
@@ -155,6 +155,8 @@ def _safe_query_params(request: Request) -> dict[str, str]:
     return safe
 
 
-def _sanitize_statement(statement: str) -> str:
+def _sanitize_statement(statement: str, *, max_chars: int) -> str:
     collapsed = " ".join(statement.strip().split())
-    return collapsed[:1000]
+    if max_chars == 0 or len(collapsed) <= max_chars:
+        return collapsed
+    return f"{collapsed[:max_chars]}..."

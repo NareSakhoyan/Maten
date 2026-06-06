@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from uuid import uuid4
 
@@ -17,6 +18,8 @@ from app.db.models import (
     ExternalLookupSearchMode,
     ExternalLookupStatus,
     ExternalProvider,
+    JobKind,
+    JobStageEvent,
     Lexeme,
     LexemeForm,
     LexemeStatus,
@@ -28,6 +31,7 @@ from app.db.models import (
     ReferenceSource,
 )
 from app.services.discovery.discovery_candidate_service import DiscoveryCandidateService
+import app.services.discovery.discovery_candidate_service as discovery_candidate_service_module
 from app.utils.token_classification import classify_token
 from conftest import PRIMARY_USER_ID
 
@@ -111,6 +115,97 @@ def _add_occurrence(
     session.flush()
 
 
+def _add_plausible_candidate(
+    session: Session,
+    *,
+    document: Document,
+    page: DocumentPage,
+    normalized_form: str,
+    token: str,
+    occurrence_count: int,
+    page_count: int,
+) -> None:
+    _add_occurrence(
+        session,
+        document=document,
+        page=page,
+        token=token,
+        normalized_token=normalized_form,
+        context=f"{token} context",
+    )
+    session.add(
+        DiscoveryCandidate(
+            id=uuid4(),
+            user_id=PRIMARY_USER_ID,
+            document_id=document.id,
+            normalized_form=normalized_form,
+            occurrence_count=occurrence_count,
+            page_count=page_count,
+            resolution_status="unknown_plausible",
+            candidate_type="unknown_plausible",
+            interest_score=50.0,
+            review_status="unreviewed",
+        )
+    )
+    session.flush()
+
+
+def test_discovery_stage_checkpoint_commits_outside_build_session(
+    db_session: Session,
+    session_factory,
+    monkeypatch,
+) -> None:
+    document, _page = _seed_document(db_session)
+    run = DiscoveryBuildRun(
+        id=uuid4(),
+        user_id=str(PRIMARY_USER_ID),
+        document_id=document.id,
+        status=MorphologyRunStatus.RUNNING,
+        current_stage_code="discovery_running",
+        current_stage_label="Discovery running",
+        progress_percent=5,
+    )
+    db_session.add(run)
+    db_session.commit()
+
+    @contextmanager
+    def isolated_session_scope():
+        session = session_factory()
+        try:
+            yield session
+            session.commit()
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            session.close()
+
+    monkeypatch.setattr(discovery_candidate_service_module, "session_scope", isolated_session_scope)
+
+    service = DiscoveryCandidateService(nayiri_corpus_service=EmptyCorpusService())
+    service._commit_run_stage_checkpoint(
+        run.id,
+        stage_code="collecting_evidence",
+        progress_percent=45,
+    )
+
+    db_session.expire_all()
+    refreshed_run = db_session.get(DiscoveryBuildRun, run.id)
+    assert refreshed_run is not None
+    assert refreshed_run.current_stage_code == "collecting_evidence"
+    assert refreshed_run.progress_percent == 45
+
+    event = db_session.scalar(
+        select(JobStageEvent).where(
+            JobStageEvent.job_kind == JobKind.DISCOVERY_BUILD,
+            JobStageEvent.job_id == str(run.id),
+            JobStageEvent.stage_code == "collecting_evidence",
+        )
+    )
+    assert event is not None
+    assert event.progress_percent == 45
+
+
 def test_build_ranks_unknowns_and_suppresses_known_and_noise(db_session: Session) -> None:
     document, page = _seed_document(db_session)
     _add_occurrence(
@@ -172,7 +267,7 @@ def test_build_ranks_unknowns_and_suppresses_known_and_noise(db_session: Session
     assert summary.resolved_known == 1
     assert summary.unknown_plausible == 1
     assert summary.probable_ocr_noise == 1
-    assert summary.shown_in_queue == 1
+    assert summary.shown_in_queue == 0
 
     rows = {
         row.normalized_form: row
@@ -182,7 +277,7 @@ def test_build_ranks_unknowns_and_suppresses_known_and_noise(db_session: Session
     }
     assert rows["գիրք"].candidate_type == "known_suppressed"
     assert rows["անծանօթ"].resolution_status == "unknown_plausible"
-    assert rows["անծանօթ"].interest_score > rows["գիրք"].interest_score
+    assert rows["անծանօթ"].interest_score == 0
     assert rows["2ն"].candidate_type == "noise_suppressed"
 
     visible, total = service.list_candidates(
@@ -192,8 +287,8 @@ def test_build_ranks_unknowns_and_suppresses_known_and_noise(db_session: Session
         limit=20,
         offset=0,
     )
-    assert total == 1
-    assert [candidate.normalized_form for candidate in visible] == ["անծանօթ"]
+    assert total == 0
+    assert visible == []
 
 
 def test_strong_local_corpus_attestation_is_suppressed_without_web_lookup(db_session: Session) -> None:
@@ -294,7 +389,7 @@ def test_pioner_named_entity_evidence_stays_visible_and_non_validating(db_sessio
     assert candidate.best_evidence_summary["validation_strength"] != "validates_word"
 
 
-def test_imported_reference_without_definition_becomes_poorly_defined(db_session: Session) -> None:
+def test_imported_reference_without_definition_is_suppressed_as_attested(db_session: Session) -> None:
     document, page = _seed_document(db_session)
     _add_occurrence(
         db_session,
@@ -327,6 +422,8 @@ def test_imported_reference_without_definition_becomes_poorly_defined(db_session
     summary = service.build_for_document(db_session, user_id=PRIMARY_USER_ID, document_id=document.id)
 
     assert summary.poorly_defined == 1
+    assert summary.suppressed == 1
+    assert summary.shown_in_queue == 0
     candidate = db_session.scalar(
         select(DiscoveryCandidate).where(
             DiscoveryCandidate.document_id == document.id,
@@ -335,6 +432,7 @@ def test_imported_reference_without_definition_becomes_poorly_defined(db_session
     )
     assert candidate is not None
     assert candidate.resolution_status == "poorly_defined"
+    assert candidate.interest_score == 0
     assert candidate.best_evidence_summary["definition_quality"] == "missing"
 
 
@@ -624,8 +722,8 @@ def test_summary_uses_projection_counts_and_latest_build(db_session: Session) ->
     summary = service.get_summary(db_session, user_id=PRIMARY_USER_ID, document_id=document.id)
 
     assert summary.total_candidates == 2
-    assert summary.visible_candidates == 1
-    assert summary.suppressed_candidates == 1
+    assert summary.visible_candidates == 0
+    assert summary.suppressed_candidates == 2
     assert summary.reviewed_candidates == 1
     assert summary.unreviewed_candidates == 1
     assert summary.by_candidate_type["known_suppressed"] == 1
@@ -634,3 +732,129 @@ def test_summary_uses_projection_counts_and_latest_build(db_session: Session) ->
     assert summary.latest_build is not None
     assert summary.latest_build.id == run.id
     assert summary.latest_build.status == "completed"
+
+
+def test_rare_unknown_plausible_remains_visible_in_default_queue(db_session: Session) -> None:
+    document, page = _seed_document(db_session)
+    _add_plausible_candidate(
+        db_session,
+        document=document,
+        page=page,
+        normalized_form="նորաբառ",
+        token="Նորաբառ",
+        occurrence_count=3,
+        page_count=2,
+    )
+    db_session.commit()
+
+    service = DiscoveryCandidateService(nayiri_corpus_service=EmptyCorpusService())
+    visible, total = service.list_candidates(
+        db_session,
+        user_id=PRIMARY_USER_ID,
+        document_id=document.id,
+        limit=20,
+        offset=0,
+    )
+
+    assert total == 1
+    assert len(visible) == 1
+    assert visible[0].normalized_form == "նորաբառ"
+
+    summary = service.get_summary(db_session, user_id=PRIMARY_USER_ID, document_id=document.id)
+    assert summary.visible_candidates == 1
+    assert summary.suppressed_candidates == 0
+
+
+def test_default_candidate_order_shows_lower_occurrences_first(db_session: Session) -> None:
+    document, page = _seed_document(db_session)
+    _add_plausible_candidate(
+        db_session,
+        document=document,
+        page=page,
+        normalized_form="երեք",
+        token="Երեք",
+        occurrence_count=3,
+        page_count=2,
+    )
+    _add_plausible_candidate(
+        db_session,
+        document=document,
+        page=page,
+        normalized_form="մէկ",
+        token="Մէկ",
+        occurrence_count=1,
+        page_count=1,
+    )
+    db_session.commit()
+
+    service = DiscoveryCandidateService(nayiri_corpus_service=EmptyCorpusService())
+    visible, total = service.list_candidates(
+        db_session,
+        user_id=PRIMARY_USER_ID,
+        document_id=document.id,
+        limit=20,
+        offset=0,
+    )
+
+    assert total == 2
+    assert [candidate.normalized_form for candidate in visible] == ["մէկ", "երեք"]
+
+
+def test_high_frequency_unknown_plausible_hidden_from_default_queue(db_session: Session) -> None:
+    document, page = _seed_document(db_session)
+    _add_plausible_candidate(
+        db_session,
+        document=document,
+        page=page,
+        normalized_form="կը",
+        token="Կը",
+        occurrence_count=4,
+        page_count=3,
+    )
+    db_session.commit()
+
+    service = DiscoveryCandidateService(nayiri_corpus_service=EmptyCorpusService())
+    visible, total = service.list_candidates(
+        db_session,
+        user_id=PRIMARY_USER_ID,
+        document_id=document.id,
+        limit=20,
+        offset=0,
+    )
+
+    assert total == 0
+    assert visible == []
+
+    summary = service.get_summary(db_session, user_id=PRIMARY_USER_ID, document_id=document.id)
+    assert summary.total_candidates == 1
+    assert summary.visible_candidates == 0
+    assert summary.suppressed_candidates == 1
+
+
+def test_high_frequency_unknown_plausible_visible_when_include_suppressed(db_session: Session) -> None:
+    document, page = _seed_document(db_session)
+    _add_plausible_candidate(
+        db_session,
+        document=document,
+        page=page,
+        normalized_form="մը",
+        token="Մը",
+        occurrence_count=12,
+        page_count=7,
+    )
+    db_session.commit()
+
+    service = DiscoveryCandidateService(nayiri_corpus_service=EmptyCorpusService())
+    visible, total = service.list_candidates(
+        db_session,
+        user_id=PRIMARY_USER_ID,
+        document_id=document.id,
+        limit=20,
+        offset=0,
+        include_suppressed=True,
+    )
+
+    assert total == 1
+    assert len(visible) == 1
+    assert visible[0].normalized_form == "մը"
+    assert visible[0].resolution_status == "unknown_plausible"
